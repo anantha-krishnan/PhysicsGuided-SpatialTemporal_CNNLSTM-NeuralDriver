@@ -1,5 +1,5 @@
 <!--The Industry Standard Definition for a Flat Test Track-->
-<!--2km length, 3.5m lane width (Standard Highway specs)-->
+<!--2km length, 7m lane width (Standard Highway specs)-->
 <?xml version="1.0" encoding="UTF-8"?>
 <OpenDRIVE>
     <header revMajor="1" revMinor="4" name="FlatTrack" version="1.00" date="Tue Feb 10 2026 12:00:00 GMT+0530 (India Standard Time)" north="0.0" south="0.0" east="0.0" west="0.0">
@@ -23,12 +23,12 @@
                     <lane id="1" type="driving" level="false">
                         <link>
                         </link>
-                        <width sOffset="0.0" a="3.5" b="0.0" c="0.0" d="0.0"/>
+                        <width sOffset="0.0" a="7" b="0.0" c="0.0" d="0.0"/>
                     </lane>
                     <lane id="2" type="driving" level="false">
                         <link>
                         </link>
-                        <width sOffset="0.0" a="3.5" b="0.0" c="0.0" d="0.0"/>
+                        <width sOffset="0.0" a="7" b="0.0" c="0.0" d="0.0"/>
                     </lane>
                 </left>
                 <center>
@@ -41,12 +41,12 @@
                     <lane id="-1" type="driving" level="false">
                         <link>
                         </link>
-                        <width sOffset="0.0" a="3.5" b="0.0" c="0.0" d="0.0"/>
+                        <width sOffset="0.0" a="7" b="0.0" c="0.0" d="0.0"/>
                     </lane>
                     <lane id="-2" type="driving" level="false">
                         <link>
                         </link>
-                        <width sOffset="0.0" a="3.5" b="0.0" c="0.0" d="0.0"/>
+                        <width sOffset="0.0" a="7" b="0.0" c="0.0" d="0.0"/>
                     </lane>
                 </right>
             </laneSection>
