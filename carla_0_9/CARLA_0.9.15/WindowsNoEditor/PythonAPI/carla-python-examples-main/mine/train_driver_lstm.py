@@ -1,3 +1,4 @@
+# train_driver_lstm.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,6 +17,11 @@ current_dir = current_file_path.parent
 CSV_FILE = current_dir.parent / "Map_Layouts" / "lane_change_dataset.csv"
 MODEL_SAVE_PATH = current_dir.parent / "Map_Layouts" / "lstm_driver.pth"
 SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.pkl"
+# Feature and Target Columns
+feature_cols = ['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input','lat_accel_input']
+target_cols = ['steer_cmd', 'throttle_cmd', 'brake_cmd']
+input_dim = len(feature_cols)
+output_dim = 2 # Steer, Longitudinal (Throttle-Brake)
 
 BATCH_SIZE = 64
 EPOCHS = 100            # Set high, Early Stopping will cut it short
@@ -82,9 +88,7 @@ def create_sequences_from_df(df, seq_len):
     all_sequences = []
     all_targets = []
     all_raws = []
-
-    feature_cols = ['speed_input', 'cte_input', 'heading_error_input', 'future_cte_input']
-    target_cols = ['steer_cmd', 'throttle_cmd', 'brake_cmd']
+    
     
     # Group by episode to respect physics continuity
     episode_groups = df.groupby('episode_id')
@@ -134,30 +138,53 @@ class KinematicLSTMLoss(nn.Module):
         super(KinematicLSTMLoss, self).__init__()
         self.mse = nn.MSELoss()
         self.L = WHEELBASE
-        # Convert scaler params to tensors for GPU usage
+        
+        
         self.scaler_mean = torch.tensor(scaler.mean_, dtype=torch.float32).to(device)
         self.scaler_scale = torch.tensor(scaler.scale_, dtype=torch.float32).to(device)
 
     def forward(self, predictions, targets, inputs_scaled):
-        # 1. Cloning Loss
-        loss = self.mse(predictions, targets)
         
-        # 2. Physics Check: Unscale the Speed
-        # Speed is index 0 in the inputs
+        # --- 1. CLONING LOSS (Imitation) ---
+        cloning_loss = self.mse(predictions, targets)
+        
+        # --- 2. PHYSICS PREPARATION ---
+        # Unscale inputs to get real Speed (m/s)
         real_inputs = (inputs_scaled * self.scaler_scale) + self.scaler_mean
-        speed_ms = real_inputs[:, 0]
+        speed_ms = real_inputs[:, 0] # Index 0 is Speed
         
-        # 3. Lat Accel Check
-        pred_steer = predictions[:, 0]
-        steer_rad = pred_steer * 1.22 # Max steer rad
+        # Get Predictions
+        pred_steer = predictions[:, 0]     # -1 to 1
+        pred_long = predictions[:, 1]      # -1 (Brake) to 1 (Throttle)
         
-        lat_accel = (speed_ms**2 / self.L) * torch.tan(steer_rad)
+        # --- 3. LATERAL PHYSICS (Steering Limit) ---
+        MAX_STEER_RAD = 1.22
+        steer_rad = pred_steer * MAX_STEER_RAD
         
-        # Penalize if > 0.8g (approx 8.0 m/s^2)
-        violation = torch.relu(torch.abs(lat_accel) - 8.0)
-        physics_penalty = torch.mean(violation**2)
+        # Theoretical Lat Accel = v^2 / L * tan(delta)
+        pred_a_lat = (speed_ms**2 / self.L) * torch.tan(steer_rad)
         
-        return loss + (0.1 * physics_penalty)
+        # --- 4. LONGITUDINAL PHYSICS (Approximate) ---
+        # Map output (-1 to 1) to roughly G-force
+        # Braking is strong (~1.0g), Acceleration is weaker (~0.5g for average car)
+        # We approximate: Long Accel ~= pred_long * 9.8
+        pred_a_long = pred_long * 9.8
+        
+        # --- 5. FRICTION CIRCLE LOSS (The "Combined" Constraint) ---
+        # Total Gs = sqrt(a_lat^2 + a_long^2)
+        total_accel = torch.sqrt(pred_a_lat**2 + pred_a_long**2)
+        
+        # Limit: 9.0 m/s^2 (approx 0.9g)
+        FRICTION_LIMIT = 9.0 
+        
+        # ReLU: Only penalize if we exceed the limit
+        friction_violation = torch.relu(total_accel - FRICTION_LIMIT)
+        
+        physics_loss = torch.mean(friction_violation**2)
+        
+        # Combine: 
+        # Strong penalty (0.5) because violating physics causes crashes
+        return cloning_loss + (0.5 * physics_loss)
 
 # --- 5. TRAINING LOOP ---
 def train():
@@ -174,7 +201,6 @@ def train():
     print(f"Train Episodes: {len(train_eps)} | Val Episodes: {len(val_eps)}")
 
     # B. FIT SCALER ON TRAINING DATA ONLY (Prevent Data Leakage)
-    feature_cols = ['speed_input', 'cte_input', 'heading_error_input', 'future_cte_input']
     scaler = StandardScaler()
     
     # Fit on Train, Transform both
@@ -196,7 +222,7 @@ def train():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
     
     # E. MODEL SETUP
-    model = LSTMDriver(input_dim=4, hidden_dim=HIDDEN_SIZE, output_dim=2).to(device)
+    model = LSTMDriver(input_dim=input_dim, hidden_dim=HIDDEN_SIZE, output_dim=output_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     loss_fn = KinematicLSTMLoss(scaler)
     
@@ -246,5 +272,58 @@ def train():
     early_stopper.restore_best_weights(model)
     print("Model Training Complete.")
 
+def get_model_architecture():
+    from torchviz import make_dot
+    from torchinfo import summary
+    import os
+    
+    # 1. Re-initialize model
+    model = LSTMDriver(input_dim=input_dim, hidden_dim=HIDDEN_SIZE, output_dim=output_dim).to(device)
+    dummy_input = torch.randn(BATCH_SIZE, SEQUENCE_LENGTH, input_dim).to(device)
+
+    print("\n" + "="*30)
+    print("     GENERATING HIGH-RES CHART")
+    print("="*30)
+
+    # 2. Run Forward Pass
+    output = model(dummy_input)
+
+    # 3. Create Graph
+    # show_attrs=True: Shows the dimensions inside the boxes (Crucial)
+    # show_saved=True: Shows memory cells
+    dot = make_dot(output, params=dict(model.named_parameters()), show_attrs=True, show_saved=True)
+    
+    # --- SETTINGS FOR QUALITY ---
+    dot.attr(rankdir='LR')       # Left-to-Right orientation
+    dot.attr(dpi='300')          # 300 DPI (Print Quality)
+    dot.attr(size='20,20')       # Max size in inches (prevents tiny cramping)
+    dot.attr(overlap='false')    # Prevent boxes from covering each other
+    dot.attr(fontsize='12')      # Readable font size
+    
+    # --- EXPORT 1: PDF (Best for Zooming) ---
+    dot.format = 'pdf'
+    pdf_path = current_dir.parent / "Map_Layouts" / "architecture_quality"
+    try:
+        dot.render(pdf_path)
+        print(f"[SUCCESS] Saved Vector PDF to {pdf_path}.pdf")
+    except Exception as e:
+        print(f"[ERROR] Could not save PDF. Is Graphviz installed? {e}")
+
+    # --- EXPORT 2: HIGH-RES PNG (Backup) ---
+    dot.format = 'png'
+    png_path = current_dir.parent / "Map_Layouts" / "architecture_quality"
+    try:
+        dot.render(png_path)
+        print(f"[SUCCESS] Saved High-Res PNG to {png_path}.png")
+    except Exception as e:
+        print(f"[ERROR] Could not save PNG: {e}")
+
+    # Check if files exist and are not empty
+    if os.path.exists(f"{pdf_path}.pdf") and os.path.getsize(f"{pdf_path}.pdf") < 100:
+        print("\n!!! WARNING: The generated file is empty (0kb).")
+        print("This usually means 'Graphviz' is not installed on your system.")
+        print("Please install it: https://graphviz.org/download/")
+    
 if __name__ == "__main__":
+    get_model_architecture()
     train()

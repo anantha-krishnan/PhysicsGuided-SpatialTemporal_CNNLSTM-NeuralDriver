@@ -1,3 +1,4 @@
+# neural_driver.py
 import carla
 import torch
 import torch.nn as nn
@@ -19,9 +20,9 @@ MODEL_PATH = MODEL_SAVE_PATH
 SCALER_PATH = SCALER_SAVE_PATH
 SEQUENCE_LENGTH = 30    # Must match training
 HIDDEN_SIZE = 64
-INPUT_DIM = 4  # speed, cte, heading, future_cte
+INPUT_DIM = 7 # speed, speed_error, cte, heading, future_cte, yaw_rate, lat_accel
 OUTPUT_DIM = 2 # steer, long
-
+last_closest_idx = 0
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -53,46 +54,43 @@ class NeuralController:
         # We initialize it with zeros, but will fill it quickly
         self.history_buffer = deque(maxlen=SEQUENCE_LENGTH)
         
-    def process(self, speed_ms, cte, heading_error, future_cte):
-        # 1. Prepare Input Vector
-        # MUST Match training order: [speed, cte, heading, future]
+    
+    def process(self, speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel):
+        
+        # --- STEP 1: CLIP THE RAW INPUTS FIRST ---
+        # This ensures the scaler only sees values within the expected range.
+        #cte_clipped = np.clip(cte, -3.0, 3.0)
+        #future_cte_clipped = np.clip(future_cte, -3.0, 3.0)
+        #heading_error_clipped = np.clip(heading_error, -1.5, 1.5) # ~85 degrees
+        #speed_error_clipped = np.clip(speed_error, -10.0, 10.0)
+        #speed_error_clipped = speed_error  # We can choose to not clip speed error if we want the model to react strongly to large errors. Depends on training data distribution.
+        # --- STEP 2: CREATE THE DATAFRAME WITH THE CLIPPED VALUES ---
         raw_input_df = pd.DataFrame(
-            [[speed_ms, cte, heading_error, future_cte]], 
-            columns=['speed_input', 'cte_input', 'heading_error_input', 'future_cte_input']
+            [[speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel]], 
+            columns=['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input', 'lat_accel_input']
         )
         
-        # 2. Scale Input (Normalize)
-        scaled_input = self.scaler.transform(raw_input_df) # Returns shape (1, 4)
-        
-        # 3. Update History Buffer
-        # If buffer is empty (first frame), fill it with copies of current state
+        # --- STEP 3: SCALE THE (NOW SAFE) INPUT ---
+        scaled_input = self.scaler.transform(raw_input_df)
+
+        # --- THE REST OF THE FUNCTION REMAINS THE SAME ---
         if len(self.history_buffer) == 0:
             for _ in range(SEQUENCE_LENGTH):
                 self.history_buffer.append(scaled_input[0])
         else:
             self.history_buffer.append(scaled_input[0])
-            
-        # 4. Convert to Tensor
-        # Shape: (1, 10, 4) -> (Batch, Seq, Features)
-        input_tensor = torch.tensor([list(self.history_buffer)], dtype=torch.float32).to(device)
         
-        # 5. Inference
+        history_np = np.array(self.history_buffer)    
+        input_tensor = torch.tensor(history_np, dtype=torch.float32).unsqueeze(0).to(device)
+        
         with torch.no_grad():
             output = self.model(input_tensor).cpu().numpy()[0]
             
-        # 6. Parse Output
-        # Network Output: [Steer (-1 to 1), Long (-1 to 1)]
         net_steer = output[0]
         net_long = output[1]
         
-        # Convert Net Steer to Carla Steer
-        # During training we divided by 1.22 (70 deg). We multiply back.
-        # But wait! CARLA ApplyControl expects -1.0 to 1.0. 
-        # Our training label was also -1.0 to 1.0. 
-        # So we can use output directly, just clipped for safety.
         steer_cmd = np.clip(net_steer, -1.0, 1.0)
         
-        # Convert Long to Throttle/Brake
         if net_long > 0:
             throttle = np.clip(net_long, 0.0, 1.0)
             brake = 0.0
@@ -108,9 +106,9 @@ def generate_ghost_path(speed_kph, lc_length):
     speed_ms = speed_kph / 3.6
     points = []
     start_y = -1.75
-    target_y = -5.25 
-    run_up = 20.0  
-    run_out = 50.0 
+    target_y = 3.25 
+    run_up = 30.0  
+    run_out = 100.0 
     total_dist = run_up + lc_length + run_out
     start_x_offset = 10.0 
     resolution = 0.5
@@ -130,27 +128,36 @@ def generate_ghost_path(speed_kph, lc_length):
             current_y = start_y + (target_y - start_y) * factor
         else:
             current_y = target_y
-        points.append([global_x, current_y])
+        points.append([global_x, current_y, speed_ms])
     return np.array(points)
 
-def get_relative_errors(vehicle, path_points):
+def get_relative_errors(vehicle, path_points_speed):
+    global last_closest_idx
+    path_points = path_points_speed[:, :2]  # Extract only (x, y) for error calculations
+    target_speed = path_points_speed[:, 2]  # Extract target speed for potential future use
     v_trans = vehicle.get_transform()
     v_loc = v_trans.location
     
-    dists = np.linalg.norm(path_points - np.array([v_loc.x, v_loc.y]), axis=1)
-    min_idx = np.argmin(dists)
-    closest_pt = path_points[min_idx]
+    search_start = last_closest_idx
+    search_end = min(last_closest_idx + 50, len(path_points))
+    search_points = path_points[search_start:search_end]
+    if len(search_points) < 5:
+        print("Warning: Not enough points in search window for error calculation. End of track may be near.")
+        return 0, 0, 0, 0, 0, -1  # Not enough points to calculate errors
+    dists = np.linalg.norm(search_points - np.array([v_loc.x, v_loc.y]), axis=1)
+    last_closest_idx = np.argmin(dists) + search_start
+    closest_pt = path_points[last_closest_idx]
     
     # CTE
     cte = v_loc.y - closest_pt[1]
     
     # Heading Error
-    if min_idx + 1 < len(path_points):
-        dx = path_points[min_idx+1][0] - path_points[min_idx][0]
-        dy = path_points[min_idx+1][1] - path_points[min_idx][1]
+    if last_closest_idx + 1 < len(path_points):
+        dx = path_points[last_closest_idx+1][0] - path_points[last_closest_idx][0]
+        dy = path_points[last_closest_idx+1][1] - path_points[last_closest_idx][1]
     else:
-        dx = path_points[min_idx][0] - path_points[min_idx-1][0]
-        dy = path_points[min_idx][1] - path_points[min_idx-1][1]
+        dx = path_points[last_closest_idx][0] - path_points[last_closest_idx-1][0]
+        dy = path_points[last_closest_idx][1] - path_points[last_closest_idx-1][1]
     
     path_yaw = math.atan2(dy, dx)
     vehicle_yaw = math.radians(v_trans.rotation.yaw)
@@ -161,9 +168,10 @@ def get_relative_errors(vehicle, path_points):
     # Future CTE
     vel = vehicle.get_velocity()
     speed = math.sqrt(vel.x**2 + vel.y**2)
+    speed_error = target_speed[last_closest_idx] -speed
     lookahead = max(5.0, speed * 1.0)
     
-    look_idx = min_idx
+    look_idx = last_closest_idx
     dist_accum = 0
     while look_idx < len(path_points)-1 and dist_accum < lookahead:
         dist_accum += 0.5
@@ -171,7 +179,7 @@ def get_relative_errors(vehicle, path_points):
     
     future_cte = v_loc.y - path_points[look_idx][1]
     
-    return speed, cte, he, future_cte, min_idx
+    return speed, speed_error, cte, he, future_cte, last_closest_idx
 
 # --- 4. MAIN EXECUTION ---
 def main():
@@ -179,7 +187,6 @@ def main():
     client = carla.Client('localhost', 2000)
     client.set_timeout(10.0)
     world = client.generate_opendrive_world(XODR_DATA.read_text())
-    
     # Sync Mode
     settings = world.get_settings()
     settings.synchronous_mode = True
@@ -193,10 +200,13 @@ def main():
     
     try:
         # TEST SCENARIO: High Speed Lane Change
-        # Speed: 40 km/h, Length: 40m
-        print("Generating Scenario: 40 km/h, 40m Lane Change")
-        ghost_path = generate_ghost_path(speed_kph=40, lc_length=40)
-        print(f"Generated Ghost Path with {len(ghost_path)} points.")
+        # Speed: 50 km/h, Length: 40m
+        cruise_speed_kph = 50
+        lc_length = 40
+        print(f"Generating Scenario: {cruise_speed_kph} km/h, {lc_length}m Lane Change")
+        ghost_path_speed = generate_ghost_path(speed_kph=cruise_speed_kph, lc_length=lc_length)
+        # ghost_path=ghost_path_speed[:, :2]  # Extract only (x, y) for error calculations
+        print(f"Generated Ghost Path with {len(ghost_path_speed)} points.")
         # Spawn
         start_pose = carla.Transform(carla.Location(x=10.0, y=-1.75, z=0.5), carla.Rotation(yaw=0.0))
         vehicle = world.spawn_actor(bp, start_pose)
@@ -219,16 +229,25 @@ def main():
             world.tick()
             
             # 2. Get State & Errors
-            speed, cte, he, fut_cte, progress_idx = get_relative_errors(vehicle, ghost_path)
-            
+            speed, speed_error, cte, he, fut_cte, progress_idx = get_relative_errors(vehicle, ghost_path_speed)
+            # CARLA angular_velocity is in Degrees/s. Convert to Radians/s for training consistency.
+            ang_vel_deg = vehicle.get_angular_velocity()
+            yaw_rate = math.radians(ang_vel_deg.z)
+            # B. Lateral Acceleration (IMU)
+            # We use the Centripetal formula: a_lat = velocity * yaw_rate
+            # This is cleaner than transforming the noisy IMU vector
+            lat_accel = speed * yaw_rate
             # Check if finished
-            if progress_idx >= len(ghost_path) - 5:
+            if progress_idx >= len(ghost_path_speed) - 5:
                 print("Track Complete!")
                 break
                 
             # 3. AI Inference
-            steer, throttle, brake = brain.process(speed, cte, he, fut_cte)
-            
+            steer, throttle, brake = brain.process(speed, speed_error, cte, he, fut_cte, yaw_rate, lat_accel)
+            if cruise_speed_kph/3.6 > 1.0 and speed < 0.5 and throttle < 0.1:
+                print(">>> WATCHDOG TRIGGERED: Kicking car forward")
+                throttle = 0.3 # Force a gentle launch
+                brake = 0.0
             # 4. Apply Control
             vehicle.apply_control(carla.VehicleControl(throttle=float(throttle), steer=float(steer), brake=float(brake)))
             

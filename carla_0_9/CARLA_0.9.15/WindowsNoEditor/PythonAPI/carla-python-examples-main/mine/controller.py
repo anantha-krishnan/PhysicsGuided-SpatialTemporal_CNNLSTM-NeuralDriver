@@ -1,3 +1,4 @@
+# controller.py
 import math
 import numpy as np
 import os
@@ -14,9 +15,9 @@ class PathFollower:
         self.t_previous = 0.0
         self.error_previous = 0.0
         self.integral_error = 0.0
-        self.Kp = 0.3
-        self.Ki = 0.2
-        self.Kd = 0.1
+        self.Kp = 0.2
+        self.Ki = 0.05
+        self.Kd = 0.3
         if direct_data is not None:
             self.data = direct_data
             self.waypoints_xy = self.data[:, 0:2]
@@ -40,9 +41,49 @@ class PathFollower:
             self.target_speeds = self.data[:, 3]
         self.current_target_speed = self.target_speeds[0]
         self.end_path=False
-        print(f"Loaded {len(self.data)} waypoints.")
     
-    
+    def get_curvature_based_speed(self, vehicle_location, lookahead_dist=10.0, max_lat_accel=4.0):
+        """
+        Scans the ghost path ahead to find the sharpest curve.
+        Returns a speed limit that keeps Lateral Accel under control.
+        
+        max_lat_accel: 4.0 m/s^2 is a comfortable limit (approx 0.4g). 
+                       Set to 7.0 or 8.0 for racing.
+        """
+        # Find current index
+        search_range = 20 # Look ahead 20 points (approx 10 meters)
+        start_idx = self.last_closest_idx
+        end_idx = min(start_idx + search_range, len(self.waypoints_xy) - 2)
+        
+        min_radius = float('inf')
+        
+        # 3-Point Circle Fit to find Radius
+        for i in range(start_idx, end_idx, 2): # Step by 2 to reduce noise
+            p1 = self.waypoints_xy[i]
+            p2 = self.waypoints_xy[i+1]
+            p3 = self.waypoints_xy[i+2]
+            
+            # Triangle Area method to find curvature
+            # Area = 0.5 * |x1(y2-y3) + x2(y3-y1) + x3(y1-y2)|
+            area = 0.5 * abs(p1[0]*(p2[1]-p3[1]) + p2[0]*(p3[1]-p1[1]) + p3[0]*(p1[1]-p2[1]))
+            
+            # Side lengths
+            a = np.linalg.norm(p1 - p2)
+            b = np.linalg.norm(p2 - p3)
+            c = np.linalg.norm(p3 - p1)
+            
+            # R = (abc) / (4 * Area)
+            if area > 1e-4: # Avoid division by zero (straight line)
+                radius = (a * b * c) / (4.0 * area)
+                if radius < min_radius:
+                    min_radius = radius
+        
+        # Physics Formula: V = sqrt(a_lat * R)
+        if min_radius == float('inf'):
+            return 999.0 # No limit
+            
+        target_speed = math.sqrt(max_lat_accel * min_radius)
+        return target_speed
     def get_pure_pursuit_steering(self, x, y, yaw, v):
         """
         Calculates steering angle using Pure Pursuit.
@@ -130,7 +171,7 @@ class PathFollower:
             D = Kd * (v_error - self.error_previous) / dt
 
         self.integral_error += v_error * dt
-        #self.integral_error = np.clip(self.integral_error, -5.0, 5.0)
+        self.integral_error = np.clip(self.integral_error, -5.0, 5.0)
 
         pid_output = (Kp * v_error) + (Ki * self.integral_error) + D
 

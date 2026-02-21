@@ -1,3 +1,4 @@
+# lanechangeorchestrator.py
 from pathlib import Path
 import carla
 import random
@@ -7,8 +8,6 @@ import csv
 import time
 import os
 
-# Import your class (assuming it's in a file named 'my_controller.py')
-# If it's in the same script, just ensure the class definition is above.
 from controller import PathFollower 
 
 # --- CONFIGURATION ---
@@ -36,19 +35,15 @@ class FlatTrackOrchestrator:
         self.bp_lib = self.world.get_blueprint_library()
         self.vehicle = None
 
-    def generate_ghost_path(self, speed_kph, lc_length):
+    def generate_ghost_path(self, speed_kph, lc_length, start_y=-1.75, target_y=-5.25, run_out=50.0):
         """
-        Generates a trajectory from Lane -1 (y=-1.75) to Lane -2 (y=-5.25)
+        Generates a Sigmoid path with variable start, end, and run-out length.
         """
         speed_ms = speed_kph / 3.6
         points = []
         
         # Geometry Params
-        start_y = -1.75
-        target_y = -5.25 # Moving to outer lane
-        
-        run_up = 30.0  # Drive straight before LC
-        run_out = 50.0 # Drive straight after LC
+        run_up = 30.0  # Time to stabilize speed before maneuver
         total_dist = run_up + lc_length + run_out
         
         # Starting X (We assume car spawns around x=10)
@@ -62,26 +57,25 @@ class FlatTrackOrchestrator:
             x_dist = i * resolution
             global_x = start_x_offset + x_dist
             
-            current_y = start_y
-            
-            # 1. Run Up (Straight)
+            # Logic
             if x_dist < run_up:
+                # Phase 1: Run Up (Straight)
                 current_y = start_y
                 
-            # 2. Lane Change (Sigmoid/Cosine)
             elif x_dist < (run_up + lc_length):
-                # Normalized progress 0.0 to 1.0
+                # Phase 2: Lane Change (Sigmoid Interpolation)
+                # p goes from 0.0 to 1.0
                 p = (x_dist - run_up) / lc_length
-                # Cosine interpolation: y = A + (B-A) * (1 - cos(p*pi))/2
-                # Note: We want 0 to 1 curve
+                
+                # Cosine S-Curve: (1 - cos(p*pi)) / 2 gives smooth 0->1 curve
                 factor = (1 - math.cos(p * math.pi)) / 2.0
                 current_y = start_y + (target_y - start_y) * factor
                 
-            # 3. Run Out (Straight)
             else:
+                # Phase 3: Run Out (Cruising)
                 current_y = target_y
             
-            # Z is slightly elevated to avoid Z-fighting with road
+            # Z=0, Speed included for the controller
             points.append([global_x, current_y, 0.0, speed_ms])
             
         return np.array(points)
@@ -153,7 +147,8 @@ class FlatTrackOrchestrator:
         
         # Expanded Header to include Future CTE
         header = [
-            "episode_id", "speed_input", "cte_input", "heading_error_input", "future_cte_input", 
+            "episode_id", "speed_input", 'speed_error_input', "cte_input", "heading_error_input", "future_cte_input", 
+            "yaw_rate_input", "lat_accel_input",
             "steer_cmd", "throttle_cmd", "brake_cmd"
         ]
         
@@ -168,13 +163,26 @@ class FlatTrackOrchestrator:
         
         for episode in range(TOTAL_EPISODES):
             # 1. Randomize
-            target_speed_kph = random.uniform(40, 110) 
+            cruise_speed_kph = random.uniform(40, 110) 
             lc_length = random.uniform(30, 80)
-            
-            print(f"Ep {episode}: Spd={target_speed_kph:.1f}, Len={lc_length:.1f}m")
+            start_y = -1.75  # Lane -1
+            # Pick a maneuver type
+            maneuver_roll = random.random() 
+            if maneuver_roll < 0.4:
+                target_y = random.uniform(-5.25, -3.75)  # Lane -2 (Left Lane Change)
+            elif maneuver_roll < 0.8:
+                target_y = random.uniform(2.25, 3.25)   # Lane 0 (Right Lane Change)
+            else:
+                offset = random.uniform(-0.5, 0.5)  # Lane -1 (Some speed variation)
+                target_y = start_y + offset
+                lc_length = random.uniform(40,60) # Longer run for straight to get more stable data
+            # cruising data
+            run_out_dist = random.uniform(50.0, 200.0)
+
+            print(f"Ep {episode}: Spd={cruise_speed_kph:.1f}, Len={lc_length:.1f}m")
 
             # 2. Generate Ghost Path (Lane -1 to -2)
-            ghost_path = self.generate_ghost_path(target_speed_kph, lc_length)
+            ghost_path = self.generate_ghost_path(cruise_speed_kph, lc_length,start_y, target_y, run_out=run_out_dist)
             
             # 3. Setup Controller
             controller = PathFollower(direct_data=ghost_path)
@@ -182,11 +190,14 @@ class FlatTrackOrchestrator:
             # 4. Spawn Vehicle (Explicitly at Start of Lane -1)
             bp = self.bp_lib.filter('model3')[0]
             # Spawn at x=10, y=-1.75 (Lane -1 Center), z=0.5
-            start_transform = carla.Transform(
-                carla.Location(x=10.0, y=-1.75, z=0.5),
-                carla.Rotation(yaw=0.0)
-            )
             
+            # Introduce random spawn offsets
+            y_offset = random.uniform(-2.5, 2.5)  # Spawn up to 2.5m off center
+            yaw_offset = random.uniform(-30, 30) # Spawn with up to 30 degrees of heading error
+            start_transform = carla.Transform(
+                carla.Location(x=10.0, y=-1.75+y_offset, z=0.5),
+                carla.Rotation(yaw=yaw_offset)
+            )
             self.vehicle = self.world.try_spawn_actor(bp, start_transform)
             if not self.vehicle:
                 print("Spawn failed, retrying...")
@@ -202,7 +213,24 @@ class FlatTrackOrchestrator:
                     v_trans = self.vehicle.get_transform()
                     vel = self.vehicle.get_velocity()
                     speed_ms = math.sqrt(vel.x**2 + vel.y**2)
+                    # Yaw Rate (rad/s)
+                    ang_vel = self.vehicle.get_angular_velocity()
+                    yaw_rate = math.radians(ang_vel.z) 
                     
+                    # Lateral Acceleration (m/s^2)
+                    # We can use the formula: a_lat = v * yaw_rate
+                    # Or get it from IMU (acc.y in local frame). Calculation is cleaner for now.
+                    lat_accel = speed_ms * yaw_rate 
+
+                    cornering_limit_ms = controller.get_curvature_based_speed(
+                        v_trans.location, 
+                        max_lat_accel=5.0 # Limit lateral Gs to ~0.5g
+                    )
+                    speed_error = cruise_speed_kph/3.6 - speed_ms
+
+                    # The actual target is the minimum of "Cruise Setpoint" and "Physics Limit"
+                    final_target_ms = min(cruise_speed_kph/3.6, cornering_limit_ms)
+
                     # End Condition: Speed too high or Path Finished
                     if controller.last_closest_idx >= len(ghost_path) - 10:
                         break
@@ -221,7 +249,7 @@ class FlatTrackOrchestrator:
                     
                     # Long Control
                     sim_time = self.world.get_snapshot().timestamp.elapsed_seconds
-                    thr, brk = controller.get_long_vel(speed_ms, target_speed_kph/3.6, sim_time)
+                    thr, brk = controller.get_long_vel(speed_ms, final_target_ms, sim_time)
                     
                     # --- APPLY CONTROL ---
                     self.vehicle.apply_control(carla.VehicleControl(
@@ -229,9 +257,12 @@ class FlatTrackOrchestrator:
                     ))
                     
                     # --- SAVE ROW ---
-                    row = [episode, speed_ms, cte, he, fut_cte, steer_cmd, thr, brk]
+                    row = [episode, 
+                           speed_ms, speed_error, cte, he, fut_cte, 
+                           yaw_rate, lat_accel,
+                           steer_cmd, thr, brk]
                     episode_data.append(row)
-                    
+                    #print(f"Ep {episode} | Target Spd: {final_target_ms:.1f} m/s | Speed: {speed_ms:.1f} m/s | CTE: {cte:.2f} m | HE: {math.degrees(he):.1f} deg | Fut CTE: {fut_cte:.2f} m | Yaw Rate: {math.degrees(yaw_rate):.1f} deg/s | Lat Accel: {lat_accel:.2f} m/s²")
                     self.world.tick()
             
             except Exception as e:
@@ -256,3 +287,5 @@ if __name__ == '__main__':
         orch.run()
     except KeyboardInterrupt:
         print("Cancelled by user")
+
+# CarlaUE4.exe /Game/Maps/RaceTrack -windowed -carla-server -benchmark -fps=30        
