@@ -16,7 +16,7 @@ current_file_path = Path(os.path.abspath(__file__))
 current_dir = current_file_path.parent
 CSV_FILE = current_dir.parent / "Map_Layouts" / "lane_change_dataset.csv"
 MODEL_SAVE_PATH = current_dir.parent / "Map_Layouts" / "lstm_driver.pth"
-SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.pkl"
+SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.npz"
 # Feature and Target Columns
 feature_cols = ['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input','lat_accel_input']
 target_cols = ['steer_cmd', 'throttle_cmd', 'brake_cmd']
@@ -184,7 +184,7 @@ class KinematicLSTMLoss(nn.Module):
         
         # Combine: 
         # Strong penalty (0.5) because violating physics causes crashes
-        return cloning_loss + (0.5 * physics_loss)
+        return cloning_loss + (0.35 * physics_loss)
 
 # --- 5. TRAINING LOOP ---
 def train():
@@ -206,8 +206,9 @@ def train():
     # Fit on Train, Transform both
     train_df[feature_cols] = scaler.fit_transform(train_df[feature_cols])
     val_df[feature_cols] = scaler.transform(val_df[feature_cols])
-    
-    joblib.dump(scaler, SCALER_SAVE_PATH)
+    feature_names = train_df[feature_cols].columns.to_list()
+
+    np.savez(SCALER_SAVE_PATH, mean=scaler.mean_, scale=scaler.scale_, feature_names=feature_names)
     
     # C. CREATE SEQUENCES
     print("Generating Sequences...")

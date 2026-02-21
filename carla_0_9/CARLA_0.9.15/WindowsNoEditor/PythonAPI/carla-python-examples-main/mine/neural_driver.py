@@ -10,11 +10,12 @@ from collections import deque
 from pathlib import Path
 import os
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 # --- CONFIGURATION ---
 current_file_path = Path(os.path.abspath(__file__))
 current_dir = current_file_path.parent
 MODEL_SAVE_PATH = current_dir.parent / "Map_Layouts" / "lstm_driver.pth"
-SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.pkl"
+SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.npz"
 XODR_DATA = current_dir.parent / "Map_Layouts" / "flattesttrack.xodr"
 MODEL_PATH = MODEL_SAVE_PATH
 SCALER_PATH = SCALER_SAVE_PATH
@@ -48,7 +49,15 @@ class NeuralController:
         self.model.eval() # Set to Inference Mode
         
         print(f"Loading Scaler from {SCALER_PATH}...")
-        self.scaler = joblib.load(SCALER_PATH)
+        # Create a new, empty scaler object
+        self.scaler = StandardScaler() 
+        # Load the saved parameters
+        scaler_params = np.load(SCALER_SAVE_PATH)
+        # Manually set the mean and scale of the new object
+        self.scaler.mean_ = scaler_params['mean']
+        self.scaler.scale_ = scaler_params['scale']
+        self.scaler.feature_names_in_ = scaler_params['feature_names']
+        print("Scaler reconstructed successfully.")
         
         # The LSTM Memory Buffer (Rolling Window)
         # We initialize it with zeros, but will fill it quickly
@@ -130,6 +139,31 @@ def generate_ghost_path(speed_kph, lc_length):
             current_y = target_y
         points.append([global_x, current_y, speed_ms])
     return np.array(points)
+def get_cte(vehicle, closest_pt_on_path, next_pt_on_path):
+        """
+        Calculates the Cross-Track Error (CTE) for the given vehicle and path.
+        CTE is the perpendicular distance of the vehicle location to the tangent line of the path at the closest point. 
+        Tangent line is obtained by looking at the next point in the path. 
+        CTE sign is obtained based on the cross product of the path tangent and the vector from the closest point to the vehicle.
+        """
+        v_trans = vehicle.get_transform()
+        v_loc = v_trans.location
+        # Path tangent vector
+        path_tangent = np.array([next_pt_on_path[0] - closest_pt_on_path[0],
+                                 next_pt_on_path[1] - closest_pt_on_path[1]])
+        path_tangent_norm = np.linalg.norm(path_tangent)
+        if path_tangent_norm == 0:
+            return 0.0  # Avoid division by zero, treat as zero error if path points are the same
+        path_tangent_unit = path_tangent / path_tangent_norm
+        # CTE: Vector from closest path point to vehicle
+        vec_to_vehicle = np.array([v_loc.x - closest_pt_on_path[0],
+                                   v_loc.y - closest_pt_on_path[1]])
+        # CTE mag
+        cte_mag = np.linalg.norm(vec_to_vehicle)
+        # CTE sign: Use cross product to determine if vehicle is left or right of path
+        cross_prod = path_tangent_unit[0] * vec_to_vehicle[1] - path_tangent_unit[1] * vec_to_vehicle[0]
+        cte_sign = 1.0 if cross_prod > 0 else -1.0
+        return cte_sign * cte_mag
 
 def get_relative_errors(vehicle, path_points_speed):
     global last_closest_idx
@@ -149,7 +183,8 @@ def get_relative_errors(vehicle, path_points_speed):
     closest_pt = path_points[last_closest_idx]
     
     # CTE
-    cte = v_loc.y - closest_pt[1]
+    #cte = v_loc.y - closest_pt[1]
+    cte = get_cte(vehicle, closest_pt, path_points[last_closest_idx+1] if last_closest_idx+1 < len(path_points) else closest_pt)
     
     # Heading Error
     if last_closest_idx + 1 < len(path_points):
@@ -177,7 +212,8 @@ def get_relative_errors(vehicle, path_points_speed):
         dist_accum += 0.5
         look_idx += 1
     
-    future_cte = v_loc.y - path_points[look_idx][1]
+    #future_cte = v_loc.y - path_points[look_idx][1]
+    future_cte = get_cte(vehicle, path_points[look_idx], path_points[look_idx+1] if look_idx+1 < len(path_points) else path_points[look_idx])
     
     return speed, speed_error, cte, he, future_cte, last_closest_idx
 

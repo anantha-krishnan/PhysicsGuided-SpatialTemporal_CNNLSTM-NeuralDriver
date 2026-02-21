@@ -11,7 +11,7 @@ import os
 from controller import PathFollower 
 
 # --- CONFIGURATION ---
-TOTAL_EPISODES = 500
+TOTAL_EPISODES = 350
 current_file_path = Path(os.path.abspath(__file__))
 current_dir = current_file_path.parent
 xodr_file_path = current_dir.parent / "Map_Layouts" / "flattesttrack.xodr"  # Adjust as needed
@@ -79,6 +79,31 @@ class FlatTrackOrchestrator:
             points.append([global_x, current_y, 0.0, speed_ms])
             
         return np.array(points)
+    def get_cte(self, vehicle, closest_pt_on_path, next_pt_on_path):
+        """
+        Calculates the Cross-Track Error (CTE) for the given vehicle and path.
+        CTE is the perpendicular distance of the vehicle location to the tangent line of the path at the closest point. 
+        Tangent line is obtained by looking at the next point in the path. 
+        CTE sign is obtained based on the cross product of the path tangent and the vector from the closest point to the vehicle.
+        """
+        v_trans = vehicle.get_transform()
+        v_loc = v_trans.location
+        # Path tangent vector
+        path_tangent = np.array([next_pt_on_path[0] - closest_pt_on_path[0],
+                                 next_pt_on_path[1] - closest_pt_on_path[1]])
+        path_tangent_norm = np.linalg.norm(path_tangent)
+        if path_tangent_norm == 0:
+            return 0.0  # Avoid division by zero, treat as zero error if path points are the same
+        path_tangent_unit = path_tangent / path_tangent_norm
+        # CTE: Vector from closest path point to vehicle
+        vec_to_vehicle = np.array([v_loc.x - closest_pt_on_path[0],
+                                   v_loc.y - closest_pt_on_path[1]])
+        # CTE mag
+        cte_mag = np.linalg.norm(vec_to_vehicle)
+        # CTE sign: Use cross product to determine if vehicle is left or right of path
+        cross_prod = path_tangent_unit[0] * vec_to_vehicle[1] - path_tangent_unit[1] * vec_to_vehicle[0]
+        cte_sign = 1.0 if cross_prod > 0 else -1.0
+        return cte_sign * cte_mag
 
     def calculate_relative_errors(self, vehicle, path_points):
         """
@@ -103,7 +128,8 @@ class FlatTrackOrchestrator:
         # Note: We need to respect sign relative to path direction.
         # Path is heading East (+X). Y is Left.
         # If car Y > path Y, car is to the left (Positive CTE).
-        cte = v_loc.y - closest_pt[1]
+        #cte = v_loc.y - closest_pt[1]
+        cte = self.get_cte(vehicle, closest_pt, path_points[min_idx+1] if min_idx+1 < len(path_points) else closest_pt)
         
         # 2. Heading Error
         # Calculate path tangent
@@ -138,7 +164,8 @@ class FlatTrackOrchestrator:
             
         future_pt = path_points[look_idx]
         # Future CTE approximation (simple Y diff for this straight track)
-        future_cte = v_loc.y - future_pt[1]
+        #future_cte = v_loc.y - future_pt[1]
+        future_cte = self.get_cte(vehicle, future_pt, path_points[look_idx+1] if look_idx+1 < len(path_points) else future_pt)
 
         return cte, he, future_cte
 
@@ -152,10 +179,10 @@ class FlatTrackOrchestrator:
             "steer_cmd", "throttle_cmd", "brake_cmd"
         ]
         
-        if not os.path.exists(OUTPUT_FILE):
-            with open(OUTPUT_FILE, 'w', newline='') as f:
-                csv.writer(f).writerow(header)
-                print(f"Created new dataset file: {OUTPUT_FILE}")
+        # if not os.path.exists(OUTPUT_FILE):
+        with open(OUTPUT_FILE, 'w', newline='') as f:
+            csv.writer(f).writerow(header)
+            print(f"Created new dataset file: {OUTPUT_FILE}")
         spectator = self.world.get_spectator()
         cam_loc = carla.Location(x=80, z=120.0) # 30 meters high
         cam_rot = carla.Rotation(pitch=-90.0) # Look straight down
