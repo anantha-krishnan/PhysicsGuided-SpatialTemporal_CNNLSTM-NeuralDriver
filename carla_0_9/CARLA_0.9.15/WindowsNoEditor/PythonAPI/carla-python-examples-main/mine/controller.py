@@ -2,10 +2,11 @@
 import math
 import numpy as np
 import os
+from utility_fncs_train_inference import ControllerUtils
 # --- CONFIGURATION ---
 # Tesla Model 3 physical dimensions for Controller
 
-WHEELBASE = 2.875  # Meters (Real value for Model 3, 1.5 is too short)
+WHEELBASE = 2.875  # Meters (Real value for Model 3)
 
 class PathFollower:
     def __init__(self, filepath=None, direct_data=None):
@@ -41,7 +42,16 @@ class PathFollower:
             self.target_speeds = self.data[:, 3]
         self.current_target_speed = self.target_speeds[0]
         self.end_path=False
+        self.utils = ControllerUtils(self.data, lookahead_dist=25.0) # For error calculations and lookahead features
     
+    def get_future_path_curvature(self, vehicle_location, lookahead_dist=10.0):
+        """
+        Calculates the curvature of the path ahead within a lookahead distance.
+        """
+        # Implementation will go here
+        pass
+
+
     def get_curvature_based_speed(self, vehicle_location, lookahead_dist=10.0, max_lat_accel=4.0):
         """
         Scans the ghost path ahead to find the sharpest curve.
@@ -54,36 +64,15 @@ class PathFollower:
         search_range = 20 # Look ahead 20 points (approx 10 meters)
         start_idx = self.last_closest_idx
         end_idx = min(start_idx + search_range, len(self.waypoints_xy) - 2)
-        
-        min_radius = float('inf')
-        
-        # 3-Point Circle Fit to find Radius
-        for i in range(start_idx, end_idx, 2): # Step by 2 to reduce noise
-            p1 = self.waypoints_xy[i]
-            p2 = self.waypoints_xy[i+1]
-            p3 = self.waypoints_xy[i+2]
-            
-            # Triangle Area method to find curvature
-            # Area = 0.5 * |x1(y2-y3) + x2(y3-y1) + x3(y1-y2)|
-            area = 0.5 * abs(p1[0]*(p2[1]-p3[1]) + p2[0]*(p3[1]-p1[1]) + p3[0]*(p1[1]-p2[1]))
-            
-            # Side lengths
-            a = np.linalg.norm(p1 - p2)
-            b = np.linalg.norm(p2 - p3)
-            c = np.linalg.norm(p3 - p1)
-            
-            # R = (abc) / (4 * Area)
-            if area > 1e-4: # Avoid division by zero (straight line)
-                radius = (a * b * c) / (4.0 * area)
-                if radius < min_radius:
-                    min_radius = radius
-        
+        min_radius = self.utils.calculate_min_radius(start_idx, end_idx)
+                
         # Physics Formula: V = sqrt(a_lat * R)
         if min_radius == float('inf'):
             return 999.0 # No limit
             
         target_speed = math.sqrt(max_lat_accel * min_radius)
         return target_speed
+    
     def get_pure_pursuit_steering(self, x, y, yaw, v):
         """
         Calculates steering angle using Pure Pursuit.

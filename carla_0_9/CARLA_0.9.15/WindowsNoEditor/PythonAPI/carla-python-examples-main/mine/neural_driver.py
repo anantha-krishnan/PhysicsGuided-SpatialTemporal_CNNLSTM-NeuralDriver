@@ -3,14 +3,13 @@ import carla
 import torch
 import torch.nn as nn
 import numpy as np
-import joblib
 import math
-import time
 from collections import deque
 from pathlib import Path
 import os
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from utility_fncs_train_inference import ControllerUtils
 # --- CONFIGURATION ---
 current_file_path = Path(os.path.abspath(__file__))
 current_dir = current_file_path.parent
@@ -21,7 +20,7 @@ MODEL_PATH = MODEL_SAVE_PATH
 SCALER_PATH = SCALER_SAVE_PATH
 SEQUENCE_LENGTH = 30    # Must match training
 HIDDEN_SIZE = 64
-INPUT_DIM = 7 # speed, speed_error, cte, heading, future_cte, yaw_rate, lat_accel
+INPUT_DIM = 8 # speed, speed_error, cte, heading, future_cte, yaw_rate, lat_accel, future_path_curvature
 OUTPUT_DIM = 2 # steer, long
 last_closest_idx = 0
 # Device
@@ -61,10 +60,9 @@ class NeuralController:
         
         # The LSTM Memory Buffer (Rolling Window)
         # We initialize it with zeros, but will fill it quickly
-        self.history_buffer = deque(maxlen=SEQUENCE_LENGTH)
-        
+        self.history_buffer = deque(maxlen=SEQUENCE_LENGTH)        
     
-    def process(self, speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel):
+    def process(self, speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel, future_path_curvature):
         
         # --- STEP 1: CLIP THE RAW INPUTS FIRST ---
         # This ensures the scaler only sees values within the expected range.
@@ -75,8 +73,8 @@ class NeuralController:
         #speed_error_clipped = speed_error  # We can choose to not clip speed error if we want the model to react strongly to large errors. Depends on training data distribution.
         # --- STEP 2: CREATE THE DATAFRAME WITH THE CLIPPED VALUES ---
         raw_input_df = pd.DataFrame(
-            [[speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel]], 
-            columns=['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input', 'lat_accel_input']
+            [[speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel, future_path_curvature]], 
+            columns=['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input', 'lat_accel_input','future_path_curvature_input']
         )
         
         # --- STEP 3: SCALE THE (NOW SAFE) INPUT ---
@@ -110,14 +108,10 @@ class NeuralController:
         return steer_cmd, throttle, brake
 
 # --- 3. HELPER: GHOST PATH GENERATOR (SAME AS ORCHESTRATOR) ---
-def generate_ghost_path(speed_kph, lc_length):
+def generate_ghost_path(speed_kph, lc_length, start_y=-1.75, target_y=3.25, run_out=50.0, run_up=30.0):
     # Generates a path from Lane -1 (y=-1.75) to Lane -2 (y=-5.25)
     speed_ms = speed_kph / 3.6
     points = []
-    start_y = -1.75
-    target_y = 3.25 
-    run_up = 30.0  
-    run_out = 100.0 
     total_dist = run_up + lc_length + run_out
     start_x_offset = 10.0 
     resolution = 0.5
@@ -137,85 +131,8 @@ def generate_ghost_path(speed_kph, lc_length):
             current_y = start_y + (target_y - start_y) * factor
         else:
             current_y = target_y
-        points.append([global_x, current_y, speed_ms])
+        points.append([global_x, current_y, 0, speed_ms])
     return np.array(points)
-def get_cte(vehicle, closest_pt_on_path, next_pt_on_path):
-        """
-        Calculates the Cross-Track Error (CTE) for the given vehicle and path.
-        CTE is the perpendicular distance of the vehicle location to the tangent line of the path at the closest point. 
-        Tangent line is obtained by looking at the next point in the path. 
-        CTE sign is obtained based on the cross product of the path tangent and the vector from the closest point to the vehicle.
-        """
-        v_trans = vehicle.get_transform()
-        v_loc = v_trans.location
-        # Path tangent vector
-        path_tangent = np.array([next_pt_on_path[0] - closest_pt_on_path[0],
-                                 next_pt_on_path[1] - closest_pt_on_path[1]])
-        path_tangent_norm = np.linalg.norm(path_tangent)
-        if path_tangent_norm == 0:
-            return 0.0  # Avoid division by zero, treat as zero error if path points are the same
-        path_tangent_unit = path_tangent / path_tangent_norm
-        # CTE: Vector from closest path point to vehicle
-        vec_to_vehicle = np.array([v_loc.x - closest_pt_on_path[0],
-                                   v_loc.y - closest_pt_on_path[1]])
-        # CTE mag
-        cte_mag = np.linalg.norm(vec_to_vehicle)
-        # CTE sign: Use cross product to determine if vehicle is left or right of path
-        cross_prod = path_tangent_unit[0] * vec_to_vehicle[1] - path_tangent_unit[1] * vec_to_vehicle[0]
-        cte_sign = 1.0 if cross_prod > 0 else -1.0
-        return cte_sign * cte_mag
-
-def get_relative_errors(vehicle, path_points_speed):
-    global last_closest_idx
-    path_points = path_points_speed[:, :2]  # Extract only (x, y) for error calculations
-    target_speed = path_points_speed[:, 2]  # Extract target speed for potential future use
-    v_trans = vehicle.get_transform()
-    v_loc = v_trans.location
-    
-    search_start = last_closest_idx
-    search_end = min(last_closest_idx + 50, len(path_points))
-    search_points = path_points[search_start:search_end]
-    if len(search_points) < 5:
-        print("Warning: Not enough points in search window for error calculation. End of track may be near.")
-        return 0, 0, 0, 0, 0, -1  # Not enough points to calculate errors
-    dists = np.linalg.norm(search_points - np.array([v_loc.x, v_loc.y]), axis=1)
-    last_closest_idx = np.argmin(dists) + search_start
-    closest_pt = path_points[last_closest_idx]
-    
-    # CTE
-    #cte = v_loc.y - closest_pt[1]
-    cte = get_cte(vehicle, closest_pt, path_points[last_closest_idx+1] if last_closest_idx+1 < len(path_points) else closest_pt)
-    
-    # Heading Error
-    if last_closest_idx + 1 < len(path_points):
-        dx = path_points[last_closest_idx+1][0] - path_points[last_closest_idx][0]
-        dy = path_points[last_closest_idx+1][1] - path_points[last_closest_idx][1]
-    else:
-        dx = path_points[last_closest_idx][0] - path_points[last_closest_idx-1][0]
-        dy = path_points[last_closest_idx][1] - path_points[last_closest_idx-1][1]
-    
-    path_yaw = math.atan2(dy, dx)
-    vehicle_yaw = math.radians(v_trans.rotation.yaw)
-    he = vehicle_yaw - path_yaw
-    while he > math.pi: he -= 2*math.pi
-    while he < -math.pi: he += 2*math.pi
-    
-    # Future CTE
-    vel = vehicle.get_velocity()
-    speed = math.sqrt(vel.x**2 + vel.y**2)
-    speed_error = target_speed[last_closest_idx] -speed
-    lookahead = max(5.0, speed * 1.0)
-    
-    look_idx = last_closest_idx
-    dist_accum = 0
-    while look_idx < len(path_points)-1 and dist_accum < lookahead:
-        dist_accum += 0.5
-        look_idx += 1
-    
-    #future_cte = v_loc.y - path_points[look_idx][1]
-    future_cte = get_cte(vehicle, path_points[look_idx], path_points[look_idx+1] if look_idx+1 < len(path_points) else path_points[look_idx])
-    
-    return speed, speed_error, cte, he, future_cte, last_closest_idx
 
 # --- 4. MAIN EXECUTION ---
 def main():
@@ -233,14 +150,18 @@ def main():
     
     # Initialize Neural Brain
     brain = NeuralController()
-    
     try:
         # TEST SCENARIO: High Speed Lane Change
         # Speed: 50 km/h, Length: 40m
-        cruise_speed_kph = 50
-        lc_length = 40
+        cruise_speed_kph = 60
+        lc_length = 60
+        start_y = -1.75
+        target_y = -5.25 
+        run_up = 30.0  
+        run_out = 50.0 
         print(f"Generating Scenario: {cruise_speed_kph} km/h, {lc_length}m Lane Change")
-        ghost_path_speed = generate_ghost_path(speed_kph=cruise_speed_kph, lc_length=lc_length)
+        ghost_path_speed = generate_ghost_path(speed_kph=cruise_speed_kph, lc_length=lc_length, start_y=start_y, target_y=target_y, run_up=run_up, run_out=run_out)
+        error_calc = ControllerUtils(data=ghost_path_speed, lookahead_dist=25.0)
         # ghost_path=ghost_path_speed[:, :2]  # Extract only (x, y) for error calculations
         print(f"Generated Ghost Path with {len(ghost_path_speed)} points.")
         # Spawn
@@ -265,7 +186,8 @@ def main():
             world.tick()
             
             # 2. Get State & Errors
-            speed, speed_error, cte, he, fut_cte, progress_idx = get_relative_errors(vehicle, ghost_path_speed)
+            # speed, speed_error, cte, he, fut_cte, progress_idx = get_relative_errors(vehicle, ghost_path_speed)
+            cte, he, fut_cte, speed, speed_error, progress_idx, future_path_curvature = error_calc.calculate_relative_errors(vehicle)
             # CARLA angular_velocity is in Degrees/s. Convert to Radians/s for training consistency.
             ang_vel_deg = vehicle.get_angular_velocity()
             yaw_rate = math.radians(ang_vel_deg.z)
@@ -279,7 +201,7 @@ def main():
                 break
                 
             # 3. AI Inference
-            steer, throttle, brake = brain.process(speed, speed_error, cte, he, fut_cte, yaw_rate, lat_accel)
+            steer, throttle, brake = brain.process(speed, speed_error, cte, he, fut_cte, yaw_rate, lat_accel, future_path_curvature)
             if cruise_speed_kph/3.6 > 1.0 and speed < 0.5 and throttle < 0.1:
                 print(">>> WATCHDOG TRIGGERED: Kicking car forward")
                 throttle = 0.3 # Force a gentle launch

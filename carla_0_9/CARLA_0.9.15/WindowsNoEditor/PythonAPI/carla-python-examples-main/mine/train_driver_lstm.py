@@ -7,7 +7,6 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-import joblib
 from pathlib import Path
 import os
 import copy
@@ -18,7 +17,7 @@ CSV_FILE = current_dir.parent / "Map_Layouts" / "lane_change_dataset.csv"
 MODEL_SAVE_PATH = current_dir.parent / "Map_Layouts" / "lstm_driver.pth"
 SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.npz"
 # Feature and Target Columns
-feature_cols = ['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input','lat_accel_input']
+feature_cols = ['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input','lat_accel_input','future_path_curvature_input']
 target_cols = ['steer_cmd', 'throttle_cmd', 'brake_cmd']
 input_dim = len(feature_cols)
 output_dim = 2 # Steer, Longitudinal (Throttle-Brake)

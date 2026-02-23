@@ -9,7 +9,7 @@ import time
 import os
 
 from controller import PathFollower 
-
+from utility_fncs_train_inference import ControllerUtils
 # --- CONFIGURATION ---
 TOTAL_EPISODES = 350
 current_file_path = Path(os.path.abspath(__file__))
@@ -79,103 +79,17 @@ class FlatTrackOrchestrator:
             points.append([global_x, current_y, 0.0, speed_ms])
             
         return np.array(points)
-    def get_cte(self, vehicle, closest_pt_on_path, next_pt_on_path):
-        """
-        Calculates the Cross-Track Error (CTE) for the given vehicle and path.
-        CTE is the perpendicular distance of the vehicle location to the tangent line of the path at the closest point. 
-        Tangent line is obtained by looking at the next point in the path. 
-        CTE sign is obtained based on the cross product of the path tangent and the vector from the closest point to the vehicle.
-        """
-        v_trans = vehicle.get_transform()
-        v_loc = v_trans.location
-        # Path tangent vector
-        path_tangent = np.array([next_pt_on_path[0] - closest_pt_on_path[0],
-                                 next_pt_on_path[1] - closest_pt_on_path[1]])
-        path_tangent_norm = np.linalg.norm(path_tangent)
-        if path_tangent_norm == 0:
-            return 0.0  # Avoid division by zero, treat as zero error if path points are the same
-        path_tangent_unit = path_tangent / path_tangent_norm
-        # CTE: Vector from closest path point to vehicle
-        vec_to_vehicle = np.array([v_loc.x - closest_pt_on_path[0],
-                                   v_loc.y - closest_pt_on_path[1]])
-        # CTE mag
-        cte_mag = np.linalg.norm(vec_to_vehicle)
-        # CTE sign: Use cross product to determine if vehicle is left or right of path
-        cross_prod = path_tangent_unit[0] * vec_to_vehicle[1] - path_tangent_unit[1] * vec_to_vehicle[0]
-        cte_sign = 1.0 if cross_prod > 0 else -1.0
-        return cte_sign * cte_mag
-
-    def calculate_relative_errors(self, vehicle, path_points):
-        """
-        Calculates Inputs for the AI:
-        1. CTE (Lateral Error)
-        2. Heading Error
-        3. Future Curvature (Lookahead Error)
-        """
-        v_trans = vehicle.get_transform()
-        v_loc = v_trans.location
-        
-        # Find closest point
-        # Since our path is X-aligned and sorted, we can optimize, 
-        # but brute force is safe for short horizons.
-        dists = np.linalg.norm(path_points[:, :2] - np.array([v_loc.x, v_loc.y]), axis=1)
-        min_idx = np.argmin(dists)
-        
-        closest_pt = path_points[min_idx]
-        
-        # 1. Lateral Error (CTE)
-        # For this X-aligned map, CTE is simply (y_car - y_path)
-        # Note: We need to respect sign relative to path direction.
-        # Path is heading East (+X). Y is Left.
-        # If car Y > path Y, car is to the left (Positive CTE).
-        #cte = v_loc.y - closest_pt[1]
-        cte = self.get_cte(vehicle, closest_pt, path_points[min_idx+1] if min_idx+1 < len(path_points) else closest_pt)
-        
-        # 2. Heading Error
-        # Calculate path tangent
-        if min_idx + 1 < len(path_points):
-            dx = path_points[min_idx+1][0] - path_points[min_idx][0]
-            dy = path_points[min_idx+1][1] - path_points[min_idx][1]
-        else:
-            dx = path_points[min_idx][0] - path_points[min_idx-1][0]
-            dy = path_points[min_idx][1] - path_points[min_idx-1][1]
-            
-        path_yaw = math.atan2(dy, dx)
-        vehicle_yaw = math.radians(v_trans.rotation.yaw)
-        
-        he = vehicle_yaw - path_yaw
-        # Normalize to -pi, pi
-        while he > math.pi: he -= 2*math.pi
-        while he < -math.pi: he += 2*math.pi
-
-        # 3. Lookahead/Future Error (The "Scalability" Feature)
-        # What is the CTE 1.0 seconds ahead?
-        # Current Speed
-        vel = vehicle.get_velocity()
-        speed = math.sqrt(vel.x**2 + vel.y**2)
-        lookahead_dist = max(5.0, speed * 1.0) # Look 1s ahead
-        
-        # Find index approx lookahead_dist away
-        look_idx = min_idx
-        dist_accum = 0
-        while look_idx < len(path_points)-1 and dist_accum < lookahead_dist:
-            dist_accum += 0.5 # resolution
-            look_idx += 1
-            
-        future_pt = path_points[look_idx]
-        # Future CTE approximation (simple Y diff for this straight track)
-        #future_cte = v_loc.y - future_pt[1]
-        future_cte = self.get_cte(vehicle, future_pt, path_points[look_idx+1] if look_idx+1 < len(path_points) else future_pt)
-
-        return cte, he, future_cte
+    
+    
 
     def run(self):
         print("Starting Data Generation on Flat Track...")
         
         # Expanded Header to include Future CTE
         header = [
-            "episode_id", "speed_input", 'speed_error_input', "cte_input", "heading_error_input", "future_cte_input", 
-            "yaw_rate_input", "lat_accel_input",
+            "episode_id", "speed_input", 'speed_error_input', "cte_input",
+            "heading_error_input", "future_cte_input", 
+            "yaw_rate_input", "lat_accel_input", "future_path_curvature_input",
             "steer_cmd", "throttle_cmd", "brake_cmd"
         ]
         
@@ -210,11 +124,10 @@ class FlatTrackOrchestrator:
 
             # 2. Generate Ghost Path (Lane -1 to -2)
             ghost_path = self.generate_ghost_path(cruise_speed_kph, lc_length,start_y, target_y, run_out=run_out_dist)
-            
+            utils = ControllerUtils(data=ghost_path, lookahead_dist=25.0) # For error calculations and lookahead features
             # 3. Setup Controller
             controller = PathFollower(direct_data=ghost_path)
             
-            # 4. Spawn Vehicle (Explicitly at Start of Lane -1)
             bp = self.bp_lib.filter('model3')[0]
             # Spawn at x=10, y=-1.75 (Lane -1 Center), z=0.5
             
@@ -225,6 +138,7 @@ class FlatTrackOrchestrator:
                 carla.Location(x=10.0, y=-1.75+y_offset, z=0.5),
                 carla.Rotation(yaw=yaw_offset)
             )
+            # 4. Spawn Vehicle 
             self.vehicle = self.world.try_spawn_actor(bp, start_transform)
             if not self.vehicle:
                 print("Spawn failed, retrying...")
@@ -263,7 +177,7 @@ class FlatTrackOrchestrator:
                         break
                     
                     # --- GET INPUTS (Features) ---
-                    cte, he, fut_cte = self.calculate_relative_errors(self.vehicle, ghost_path)
+                    cte, he, fut_cte, sp, sp_err, last_closest_idx, future_path_curvature = utils.calculate_relative_errors(self.vehicle)
                     
                     # --- GET OUTPUTS (Labels from Teacher) ---
                     steer_rad = controller.get_pure_pursuit_steering(
@@ -286,7 +200,7 @@ class FlatTrackOrchestrator:
                     # --- SAVE ROW ---
                     row = [episode, 
                            speed_ms, speed_error, cte, he, fut_cte, 
-                           yaw_rate, lat_accel,
+                           yaw_rate, lat_accel,future_path_curvature,
                            steer_cmd, thr, brk]
                     episode_data.append(row)
                     #print(f"Ep {episode} | Target Spd: {final_target_ms:.1f} m/s | Speed: {speed_ms:.1f} m/s | CTE: {cte:.2f} m | HE: {math.degrees(he):.1f} deg | Fut CTE: {fut_cte:.2f} m | Yaw Rate: {math.degrees(yaw_rate):.1f} deg/s | Lat Accel: {lat_accel:.2f} m/s²")
@@ -302,6 +216,13 @@ class FlatTrackOrchestrator:
                         csv.writer(f).writerows(episode_data)
                 
                 self.vehicle.destroy()
+            # clean up memory
+            del self.vehicle
+            del controller
+            del utils
+            del episode_data
+            del ghost_path
+
         
         # Cleanup
         self.settings.synchronous_mode = False
