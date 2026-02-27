@@ -226,3 +226,37 @@ class ControllerUtils:
         else:
             radius = float('inf') # Straight line, infinite radius
         return radius
+    def calculate_future_heading_error(self, vehicle, current_idx):
+        """
+        Calculates the difference between the car's current heading and 
+        the heading of the path at a fixed lookahead distance.
+        """
+        path_points = self.waypoints_xy
+        # Fixed lookahead of 15-20 meters is robust for city speeds
+        lookahead_dist = 20.0 
+        points_to_look_ahead = int(lookahead_dist / self.resolution)
+        
+        # Target index
+        target_idx = min(current_idx + points_to_look_ahead, len(path_points) - 2)
+        
+        # 1. Get Car Yaw
+        v_trans = vehicle.get_transform()
+        v_yaw_rad = math.radians(v_trans.rotation.yaw)
+        
+        # 2. Get Path Yaw at Lookahead Point
+        # We use the vector between target and target+1
+        p_now = path_points[target_idx, :2]
+        p_next = path_points[target_idx + 1, :2]
+        
+        dx = p_next[0] - p_now[0]
+        dy = p_next[1] - p_now[1]
+        path_yaw_rad = math.atan2(dy, dx)
+        
+        # 3. Calculate Diff
+        diff = path_yaw_rad - v_yaw_rad
+        
+        # Normalize to [-pi, pi]
+        while diff > math.pi: diff -= 2 * math.pi
+        while diff < -math.pi: diff += 2 * math.pi
+        
+        return diff

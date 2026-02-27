@@ -143,16 +143,16 @@ def main():
         target_y = 3.25 
         run_up = 30.0  
         run_out = 50.0 
-        print(f"Generating Scenario: {cruise_speed_kph} km/h, {lc_length}m Lane Change")
         #ghost_path_speed = generate_lane_change_path(speed_kph=cruise_speed_kph, lc_length=lc_length, start_y=start_y, target_y=target_y, run_up=run_up, run_out=run_out)
         #ghost_path_speed = generate_straight_path(cruise_speed_kph, length=200.0)
         turn_radius = random.uniform(15, 30) # City to rural road turn radius
-        #ghost_path_speed = generate_90_degree_turn_path(cruise_speed_kph, turn_radius, 'right', run_out=run_out)
+        ghost_path_speed = generate_90_degree_turn_path(cruise_speed_kph, turn_radius, 'left', run_out=run_out)
         #ghost_path_speed = generate_hairpin_turn_path(cruise_speed_kph, turn_radius, 'right', run_out=run_out)
         #ghost_path_speed = generate_s_curve_path(cruise_speed_kph, turn_radius, 'right', run_out=run_out)
         width = random.uniform(2.0, 4.0)   # Swerve 2-4 meters sideways
         length = random.uniform(30.0, 50.0) # Complete the swerve in 30-50 meters
-        ghost_path_speed = generate_chicane_path(cruise_speed_kph, width, length, 'right', run_out=run_out)
+        #ghost_path_speed = generate_chicane_path(cruise_speed_kph, width, length, 'right', run_out=run_out)
+        print(f"Generating Scenario: {cruise_speed_kph} km/h, Turn Radius: {turn_radius:.1f}m, Width: {width:.1f}m, Length: {length:.1f}m")
         visualizer = PygameVisualizer(window_size=(1000, 500))
         visualizer.set_path(ghost_path_speed)
 
