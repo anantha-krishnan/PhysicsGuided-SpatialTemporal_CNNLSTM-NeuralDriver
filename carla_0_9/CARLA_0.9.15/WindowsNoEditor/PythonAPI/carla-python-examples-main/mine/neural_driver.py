@@ -8,6 +8,7 @@ from collections import deque
 from pathlib import Path
 import os
 import pandas as pd
+import random
 from sklearn.preprocessing import StandardScaler
 from utility_fncs_train_inference import ControllerUtils
 from minimap import PygameVisualizer
@@ -114,8 +115,8 @@ class NeuralController:
         #else:
         #    throttle = 0.0
         #    brake = np.clip(abs(net_long), 0.0, 1.0)
-            
-        return steer_cmd, 0.4, 0.0 # For now, we return a constant throttle and no brake. The model can be extended to predict these as well.
+        
+        return steer_cmd, 0.5, 0.0 # steer, throttle, brake
 
 # --- 4. MAIN EXECUTION ---
 def main():
@@ -136,23 +137,32 @@ def main():
     try:
         # TEST SCENARIO: High Speed Lane Change
         # Speed: 50 km/h, Length: 40m
-        cruise_speed_kph = 60
+        cruise_speed_kph = 60.0
         lc_length = 60
         start_y = -1.75
         target_y = 3.25 
         run_up = 30.0  
         run_out = 50.0 
         print(f"Generating Scenario: {cruise_speed_kph} km/h, {lc_length}m Lane Change")
-        ghost_path_speed = generate_lane_change_path(speed_kph=cruise_speed_kph, lc_length=lc_length, start_y=start_y, target_y=target_y, run_up=run_up, run_out=run_out)
-        
+        #ghost_path_speed = generate_lane_change_path(speed_kph=cruise_speed_kph, lc_length=lc_length, start_y=start_y, target_y=target_y, run_up=run_up, run_out=run_out)
+        #ghost_path_speed = generate_straight_path(cruise_speed_kph, length=200.0)
+        turn_radius = random.uniform(15, 30) # City to rural road turn radius
+        #ghost_path_speed = generate_90_degree_turn_path(cruise_speed_kph, turn_radius, 'right', run_out=run_out)
+        #ghost_path_speed = generate_hairpin_turn_path(cruise_speed_kph, turn_radius, 'right', run_out=run_out)
+        #ghost_path_speed = generate_s_curve_path(cruise_speed_kph, turn_radius, 'right', run_out=run_out)
+        width = random.uniform(2.0, 4.0)   # Swerve 2-4 meters sideways
+        length = random.uniform(30.0, 50.0) # Complete the swerve in 30-50 meters
+        ghost_path_speed = generate_chicane_path(cruise_speed_kph, width, length, 'right', run_out=run_out)
         visualizer = PygameVisualizer(window_size=(1000, 500))
         visualizer.set_path(ghost_path_speed)
 
         error_calc = ControllerUtils(data=ghost_path_speed, lookahead_dist=25.0)
         # ghost_path=ghost_path_speed[:, :2]  # Extract only (x, y) for error calculations
         print(f"Generated Ghost Path with {len(ghost_path_speed)} points.")
-        # Spawn
-        start_pose = carla.Transform(carla.Location(x=10.0, y=-1.75, z=0.5), carla.Rotation(yaw=0.0))
+        # Spawn at the start of the path
+        start_x, start_y = ghost_path_speed[0][0], ghost_path_speed[0][1]
+        start_pose = carla.Transform(carla.Location(x=start_x, y=start_y, z=0.5), carla.Rotation(yaw=0.0))
+        #start_pose = carla.Transform(carla.Location(x=10.0, y=-1.75, z=0.5), carla.Rotation(yaw=0.0))
         vehicle = world.spawn_actor(bp, start_pose)
         
         # Spectator
