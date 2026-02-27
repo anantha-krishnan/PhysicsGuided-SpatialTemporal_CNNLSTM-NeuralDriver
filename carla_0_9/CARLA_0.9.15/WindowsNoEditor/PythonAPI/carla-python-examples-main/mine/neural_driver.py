@@ -10,6 +10,15 @@ import os
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from utility_fncs_train_inference import ControllerUtils
+from minimap import PygameVisualizer
+from path_generators import (
+    generate_straight_path,
+    generate_90_degree_turn_path,
+    generate_hairpin_turn_path,
+    generate_s_curve_path,
+    generate_lane_change_path,
+    generate_chicane_path
+)
 # --- CONFIGURATION ---
 current_file_path = Path(os.path.abspath(__file__))
 current_dir = current_file_path.parent
@@ -20,8 +29,8 @@ MODEL_PATH = MODEL_SAVE_PATH
 SCALER_PATH = SCALER_SAVE_PATH
 SEQUENCE_LENGTH = 30    # Must match training
 HIDDEN_SIZE = 64
-INPUT_DIM = 8 # speed, speed_error, cte, heading, future_cte, yaw_rate, lat_accel, future_path_curvature
-OUTPUT_DIM = 2 # steer, long
+INPUT_DIM = 4 # cte, heading_error, yaw_rate, future_path_curvature
+OUTPUT_DIM = 1 # steer
 last_closest_idx = 0
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,8 +69,8 @@ class NeuralController:
         
         # The LSTM Memory Buffer (Rolling Window)
         # We initialize it with zeros, but will fill it quickly
-        self.history_buffer = deque(maxlen=SEQUENCE_LENGTH)        
-    
+        self.history_buffer = deque(maxlen=SEQUENCE_LENGTH)
+
     def process(self, speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel, future_path_curvature):
         
         # --- STEP 1: CLIP THE RAW INPUTS FIRST ---
@@ -73,8 +82,9 @@ class NeuralController:
         #speed_error_clipped = speed_error  # We can choose to not clip speed error if we want the model to react strongly to large errors. Depends on training data distribution.
         # --- STEP 2: CREATE THE DATAFRAME WITH THE CLIPPED VALUES ---
         raw_input_df = pd.DataFrame(
-            [[speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel, future_path_curvature]], 
-            columns=['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input', 'lat_accel_input','future_path_curvature_input']
+            [[cte, heading_error, yaw_rate, future_path_curvature]], 
+            #columns=['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input', 'lat_accel_input','future_path_curvature_input']
+            columns=['cte_input', 'heading_error_input', 'yaw_rate_input','future_path_curvature_input']
         )
         
         # --- STEP 3: SCALE THE (NOW SAFE) INPUT ---
@@ -94,45 +104,18 @@ class NeuralController:
             output = self.model(input_tensor).cpu().numpy()[0]
             
         net_steer = output[0]
-        net_long = output[1]
+        #net_long = output[1]
         
         steer_cmd = np.clip(net_steer, -1.0, 1.0)
         
-        if net_long > 0:
-            throttle = np.clip(net_long, 0.0, 1.0)
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = np.clip(abs(net_long), 0.0, 1.0)
+        #if net_long > 0:
+        #    throttle = np.clip(net_long, 0.0, 1.0)
+        #    brake = 0.0
+        #else:
+        #    throttle = 0.0
+        #    brake = np.clip(abs(net_long), 0.0, 1.0)
             
-        return steer_cmd, throttle, brake
-
-# --- 3. HELPER: GHOST PATH GENERATOR (SAME AS ORCHESTRATOR) ---
-def generate_ghost_path(speed_kph, lc_length, start_y=-1.75, target_y=3.25, run_out=50.0, run_up=30.0):
-    # Generates a path from Lane -1 (y=-1.75) to Lane -2 (y=-5.25)
-    speed_ms = speed_kph / 3.6
-    points = []
-    total_dist = run_up + lc_length + run_out
-    start_x_offset = 10.0 
-    resolution = 0.5
-    
-    n_points = int(total_dist / resolution)
-    
-    for i in range(n_points):
-        x_dist = i * resolution
-        global_x = start_x_offset + x_dist
-        current_y = start_y
-        
-        if x_dist < run_up:
-            current_y = start_y
-        elif x_dist < (run_up + lc_length):
-            p = (x_dist - run_up) / lc_length
-            factor = (1 - math.cos(p * math.pi)) / 2.0
-            current_y = start_y + (target_y - start_y) * factor
-        else:
-            current_y = target_y
-        points.append([global_x, current_y, 0, speed_ms])
-    return np.array(points)
+        return steer_cmd, 0.4, 0.0 # For now, we return a constant throttle and no brake. The model can be extended to predict these as well.
 
 # --- 4. MAIN EXECUTION ---
 def main():
@@ -156,11 +139,15 @@ def main():
         cruise_speed_kph = 60
         lc_length = 60
         start_y = -1.75
-        target_y = -5.25 
+        target_y = 3.25 
         run_up = 30.0  
         run_out = 50.0 
         print(f"Generating Scenario: {cruise_speed_kph} km/h, {lc_length}m Lane Change")
-        ghost_path_speed = generate_ghost_path(speed_kph=cruise_speed_kph, lc_length=lc_length, start_y=start_y, target_y=target_y, run_up=run_up, run_out=run_out)
+        ghost_path_speed = generate_lane_change_path(speed_kph=cruise_speed_kph, lc_length=lc_length, start_y=start_y, target_y=target_y, run_up=run_up, run_out=run_out)
+        
+        visualizer = PygameVisualizer(window_size=(1000, 500))
+        visualizer.set_path(ghost_path_speed)
+
         error_calc = ControllerUtils(data=ghost_path_speed, lookahead_dist=25.0)
         # ghost_path=ghost_path_speed[:, :2]  # Extract only (x, y) for error calculations
         print(f"Generated Ghost Path with {len(ghost_path_speed)} points.")
@@ -221,7 +208,8 @@ def main():
             #spectator.set_transform(carla.Transform(cam_loc, cam_rot))
             
             # Debug Print
-            print(f"progress_idx: {progress_idx} | Err: {cte:.2f}m | Fut: {fut_cte:.2f}m | Steer: {steer:.2f} | Thr: {throttle:.2f}")
+            visualizer.render(vehicle, ghost_path_speed[progress_idx][3], speed)
+            #print(f"progress_idx: {progress_idx} | Err: {cte:.2f}m | Fut: {fut_cte:.2f}m | Steer: {steer:.2f} | Thr: {throttle:.2f}")
 
     finally:
         vehicle.destroy()

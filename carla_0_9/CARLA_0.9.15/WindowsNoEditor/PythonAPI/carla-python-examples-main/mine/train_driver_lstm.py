@@ -17,10 +17,10 @@ CSV_FILE = current_dir.parent / "Map_Layouts" / "lane_change_dataset.csv"
 MODEL_SAVE_PATH = current_dir.parent / "Map_Layouts" / "lstm_driver.pth"
 SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.npz"
 # Feature and Target Columns
-feature_cols = ['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input','lat_accel_input','future_path_curvature_input']
-target_cols = ['steer_cmd', 'throttle_cmd', 'brake_cmd']
+feature_cols = ['cte_input', 'heading_error_input', 'yaw_rate_input','future_path_curvature_input']
+target_cols = ['steer_cmd']
 input_dim = len(feature_cols)
-output_dim = 2 # Steer, Longitudinal (Throttle-Brake)
+output_dim = len(target_cols) # Steer, Longitudinal (Throttle-Brake)
 
 BATCH_SIZE = 64
 EPOCHS = 100            # Set high, Early Stopping will cut it short
@@ -75,6 +75,9 @@ class SequenceDataset(Dataset):
     def __init__(self, sequences, targets, raw_inputs):
         self.sequences = torch.tensor(sequences, dtype=torch.float32)
         self.targets = torch.tensor(targets, dtype=torch.float32)
+        # Ensure targets are (Batch, 1)
+        if self.targets.ndim == 1:
+            self.targets = self.targets.unsqueeze(1)
         self.raw_inputs = torch.tensor(raw_inputs, dtype=torch.float32)
 
     def __len__(self): return len(self.sequences)
@@ -98,8 +101,8 @@ def create_sequences_from_df(df, seq_len):
         
         # Process Targets: [Steer, Throttle-Brake]
         steer = targets[:, 0]
-        long_cmd = targets[:, 1] - targets[:, 2]
-        processed_targets = np.column_stack((steer, long_cmd))
+        #long_cmd = targets[:, 1] - targets[:, 2]
+        processed_targets = steer.reshape(-1, 1)
         
         num_samples = len(data) - seq_len
         if num_samples <= 0: continue
@@ -149,47 +152,49 @@ class KinematicLSTMLoss(nn.Module):
         
         # --- 2. PHYSICS PREPARATION ---
         # Unscale inputs to get real Speed (m/s)
-        real_inputs = (inputs_scaled * self.scaler_scale) + self.scaler_mean
-        speed_ms = real_inputs[:, 0] # Index 0 is Speed
+        #real_inputs = (inputs_scaled * self.scaler_scale) + self.scaler_mean
+        #speed_ms = real_inputs[:, 0] # Index 0 is Speed
         
         # Get Predictions
-        pred_steer = predictions[:, 0]     # -1 to 1
-        pred_long = predictions[:, 1]      # -1 (Brake) to 1 (Throttle)
+        #pred_steer = predictions[:, 0]     # -1 to 1
+        #pred_long = predictions[:, 1]      # -1 (Brake) to 1 (Throttle)
         
         # --- 3. LATERAL PHYSICS (Steering Limit) ---
-        MAX_STEER_RAD = 1.22
-        steer_rad = pred_steer * MAX_STEER_RAD
+        #MAX_STEER_RAD = 1.22
+        #steer_rad = pred_steer * MAX_STEER_RAD
         
         # Theoretical Lat Accel = v^2 / L * tan(delta)
-        pred_a_lat = (speed_ms**2 / self.L) * torch.tan(steer_rad)
+        #pred_a_lat = (speed_ms**2 / self.L) * torch.tan(steer_rad)
         
         # --- 4. LONGITUDINAL PHYSICS (Approximate) ---
         # Map output (-1 to 1) to roughly G-force
         # Braking is strong (~1.0g), Acceleration is weaker (~0.5g for average car)
         # We approximate: Long Accel ~= pred_long * 9.8
-        pred_a_long = pred_long * 9.8
+        #pred_a_long = pred_long * 9.8
         
         # --- 5. FRICTION CIRCLE LOSS (The "Combined" Constraint) ---
         # Total Gs = sqrt(a_lat^2 + a_long^2)
-        total_accel = torch.sqrt(pred_a_lat**2 + pred_a_long**2)
+        #total_accel = torch.sqrt(pred_a_lat**2 + pred_a_long**2)
         
         # Limit: 9.0 m/s^2 (approx 0.9g)
-        FRICTION_LIMIT = 9.0 
+        #FRICTION_LIMIT = 9.0 
         
         # ReLU: Only penalize if we exceed the limit
-        friction_violation = torch.relu(total_accel - FRICTION_LIMIT)
+        #friction_violation = torch.relu(total_accel - FRICTION_LIMIT)
         
-        physics_loss = torch.mean(friction_violation**2)
+        #physics_loss = torch.mean(friction_violation**2)
         
         # Combine: 
-        # Strong penalty (0.5) because violating physics causes crashes
-        return cloning_loss + (0.35 * physics_loss)
+        # penalty (0.35) because violating physics causes crashes
+        #return cloning_loss + (0.35 * physics_loss)
+        return cloning_loss
 
 # --- 5. TRAINING LOOP ---
 def train():
     print("Loading Data...")
     df = pd.read_csv(CSV_FILE)
-    
+    # drop columns we don't need
+    df = df[feature_cols + target_cols + ['episode_id']]
     # A. SPLIT BY EPISODE (Crucial for Validating Generalization)
     unique_episodes = df['episode_id'].unique()
     train_eps, val_eps = train_test_split(unique_episodes, test_size=0.2, random_state=42)
