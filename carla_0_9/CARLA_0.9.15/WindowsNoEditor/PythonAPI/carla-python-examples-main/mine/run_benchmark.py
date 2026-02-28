@@ -11,13 +11,15 @@ from datetime import datetime
 from neural_driver import NeuralController
 from utility_fncs_train_inference import ControllerUtils
 from minimap import PygameVisualizer
+from controller import PathFollower
 from path_generators import (
     generate_straight_path,
     generate_90_degree_turn_path,
     generate_lane_change_path,
     generate_chicane_path,
     generate_s_curve_path,
-    generate_hairpin_turn_path
+    generate_hairpin_turn_path,
+    generate_specific_chain
 )
 
 # --- CONFIG ---
@@ -38,9 +40,22 @@ def run_benchmark():
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = 0.033
     world.apply_settings(settings)
-    
+    MAX_LAT_ACCEL = 4.0 # m/s^2
     bp = world.get_blueprint_library().filter('model3')[0]
-
+    sequence = [['straight', 'turn_right', 'straight', 'lane_change_left', 's_curve_left', 'hairpin_left', 'straight']]
+    transition_chain_value_map={
+        'straight': [40,TEST_SPEED_KPH],
+        'turn_left': [20, min(TEST_SPEED_KPH, math.sqrt(MAX_LAT_ACCEL * 20) * 3.6)],
+        'turn_right': [25, min(TEST_SPEED_KPH, math.sqrt(MAX_LAT_ACCEL * 25) * 3.6)],
+        'hairpin_left': [15, min(TEST_SPEED_KPH, math.sqrt(MAX_LAT_ACCEL * 15) * 3.6)],
+        'hairpin_right': [15, min(TEST_SPEED_KPH, math.sqrt(MAX_LAT_ACCEL * 15) * 3.6)],
+        'lane_change_left': [2, 70], # (start_y, target_y, length)
+        'lane_change_right': [10, 40],
+        'chicane_left': [2.5, 35], # (width, length)
+        'chicane_right': [3.5, 45],
+        's_curve_left': [25, min(TEST_SPEED_KPH, math.sqrt(MAX_LAT_ACCEL * 25) * 3.6)],
+        's_curve_right': [35, min(TEST_SPEED_KPH, math.sqrt(MAX_LAT_ACCEL * 35) * 3.6)]
+    }
     # 2. Define Playlist
     scenarios = [
         ("01_Straight_Line", generate_straight_path(TEST_SPEED_KPH, length=150)),
@@ -50,6 +65,7 @@ def run_benchmark():
         ("05_Chicane_Left", generate_chicane_path(TEST_SPEED_KPH, 3.0, 40.0, 'left')),
         ("06_S_Curve", generate_s_curve_path(TEST_SPEED_KPH, 25.0, 'left')),
         ("07_Hairpin_Right", generate_hairpin_turn_path(TEST_SPEED_KPH, 12.0, 'right')), # Tighter test
+        (f"08_Seq_", generate_specific_chain(TEST_SPEED_KPH, sequence[0], transition_chain_value_map))
     ]
 
     print(f"=== Starting Benchmark of {len(scenarios)} Scenarios ===")
@@ -59,6 +75,7 @@ def run_benchmark():
         print(f">> Running: {name}")
         visualizer.set_path(path)
         brain = NeuralController()
+        controller = PathFollower(direct_data=path)
         
         error_calc = ControllerUtils(data=path, lookahead_dist=25.0)
         # Spawn
@@ -98,17 +115,20 @@ def run_benchmark():
                 world.tick()
                 
                 # Get Data
-                cte, he, fut_cte, speed, speed_error, progress_idx, future_path_curvature = error_calc.calculate_relative_errors(vehicle)
+                cte, he, fut_cte, speed, speed_error, progress_idx, future_path_curvature, fut_yaw = error_calc.calculate_relative_errors(vehicle)
                 ang_vel_deg = vehicle.get_angular_velocity()
                 yaw_rate = math.radians(ang_vel_deg.z)
                 lat_accel = speed * yaw_rate
                 visualizer.render(vehicle, path[progress_idx][3], speed)
                 
                 # Inference
-                steer, throttle, brake = brain.process(speed, speed_error, cte, he, fut_cte, yaw_rate, lat_accel, future_path_curvature)
+                steer, throttle, brake = brain.process(speed, speed_error, cte, he, fut_cte, yaw_rate, lat_accel, future_path_curvature, fut_yaw)
                 
                 # Control (Steer Only)
                 vehicle.apply_control(carla.VehicleControl(throttle=float(throttle), steer=float(steer), brake=float(brake)))
+                # Long Control
+                sim_time = world.get_snapshot().timestamp.elapsed_seconds
+                throttle, brake = controller.get_long_vel(speed, path[progress_idx][3], sim_time)
                 
                 # Logging
                 v_trans = vehicle.get_transform()
@@ -131,6 +151,7 @@ def run_benchmark():
 
         finally:
             vehicle.destroy()
+            del controller
             del error_calc
             del brain
             

@@ -30,7 +30,7 @@ MODEL_PATH = MODEL_SAVE_PATH
 SCALER_PATH = SCALER_SAVE_PATH
 SEQUENCE_LENGTH = 30    # Must match training
 HIDDEN_SIZE = 64
-INPUT_DIM = 4 # cte, heading_error, yaw_rate, future_path_curvature
+INPUT_DIM = 5 # cte, heading_error, yaw_rate, future_path_curvature, future_heading_error
 OUTPUT_DIM = 1 # steer
 last_closest_idx = 0
 # Device
@@ -40,7 +40,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class LSTMDriver(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super(LSTMDriver, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.1)
+        self.lstm = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.1)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.tanh = nn.Tanh()
 
@@ -72,7 +72,7 @@ class NeuralController:
         # We initialize it with zeros, but will fill it quickly
         self.history_buffer = deque(maxlen=SEQUENCE_LENGTH)
 
-    def process(self, speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel, future_path_curvature):
+    def process(self, speed_ms, speed_error, cte, heading_error, future_cte, yaw_rate, lat_accel, future_path_curvature, fut_yaw):
         
         # --- STEP 1: CLIP THE RAW INPUTS FIRST ---
         # This ensures the scaler only sees values within the expected range.
@@ -83,9 +83,9 @@ class NeuralController:
         #speed_error_clipped = speed_error  # We can choose to not clip speed error if we want the model to react strongly to large errors. Depends on training data distribution.
         # --- STEP 2: CREATE THE DATAFRAME WITH THE CLIPPED VALUES ---
         raw_input_df = pd.DataFrame(
-            [[cte, heading_error, yaw_rate, future_path_curvature]], 
+            [[cte, heading_error, yaw_rate, future_path_curvature, fut_yaw]], 
             #columns=['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input', 'lat_accel_input','future_path_curvature_input']
-            columns=['cte_input', 'heading_error_input', 'yaw_rate_input','future_path_curvature_input']
+            columns=['cte_input', 'heading_error_input', 'yaw_rate_input','future_path_curvature_input', 'future_heading_error_input']
         )
         
         # --- STEP 3: SCALE THE (NOW SAFE) INPUT ---

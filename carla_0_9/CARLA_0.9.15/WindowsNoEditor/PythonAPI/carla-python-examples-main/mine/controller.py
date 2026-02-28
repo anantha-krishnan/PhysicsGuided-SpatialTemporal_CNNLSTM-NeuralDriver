@@ -83,9 +83,9 @@ class PathFollower:
         look_ahead_dis = np.clip(k_dd * v, 3.0, 20.0) 
 
         # 1. Find the Closest Waypoint (Starting search from previous index)
-        # We optimize by searching only the next 500 points, not the whole file
+        # We optimize by searching only the next 50 points, not the whole file
         search_start = self.last_closest_idx
-        search_end = min(self.last_closest_idx + 500, len(self.waypoints_xy))
+        search_end = min(self.last_closest_idx + 50, len(self.waypoints_xy))
         # check if we have enough points ahead, if not, it means we are near the end, so we should end the search at the end of the list and not wrap around. 
         if search_end - search_start < 10:  # we have reached the end. inform user and end search at the end of the list
             print("Warning: Reached end of waypoints. Ending search at the end of the list.")

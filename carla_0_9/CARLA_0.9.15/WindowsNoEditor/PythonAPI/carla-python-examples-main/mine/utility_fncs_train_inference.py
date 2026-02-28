@@ -122,9 +122,10 @@ class ControllerUtils:
         #future_cte = v_loc.y - future_pt[1]
         future_cte = self.get_cte(vehicle, future_pt, path_points[look_idx+1] if look_idx+1 < len(path_points) else future_pt)
         future_path_curvature = self.calculate_signed_path_curvature(min_idx, speed)
+        fut_yaw = self.calculate_future_heading_error(vehicle_yaw, min_idx, speed)
         self.last_closest_idx = min_idx
 
-        return cte, he, future_cte, speed, speed_error, self.last_closest_idx, future_path_curvature
+        return cte, he, future_cte, speed, speed_error, self.last_closest_idx, future_path_curvature, fut_yaw
     
     def calculate_min_radius(self, start_idx, end_idx):
         """
@@ -226,22 +227,19 @@ class ControllerUtils:
         else:
             radius = float('inf') # Straight line, infinite radius
         return radius
-    def calculate_future_heading_error(self, vehicle, current_idx):
+    def calculate_future_heading_error(self, v_yaw_rad, current_idx, current_speed_ms):
         """
         Calculates the difference between the car's current heading and 
         the heading of the path at a fixed lookahead distance.
         """
         path_points = self.waypoints_xy
-        # Fixed lookahead of 15-20 meters is robust for city speeds
-        lookahead_dist = 20.0 
+        # Fixed lookahead of 10 meters is robust for city speeds
+        # Dynamic Lookahead
+        lookahead_dist = max(10.0, current_speed_ms * 1.0)
         points_to_look_ahead = int(lookahead_dist / self.resolution)
         
         # Target index
         target_idx = min(current_idx + points_to_look_ahead, len(path_points) - 2)
-        
-        # 1. Get Car Yaw
-        v_trans = vehicle.get_transform()
-        v_yaw_rad = math.radians(v_trans.rotation.yaw)
         
         # 2. Get Path Yaw at Lookahead Point
         # We use the vector between target and target+1
@@ -258,5 +256,5 @@ class ControllerUtils:
         # Normalize to [-pi, pi]
         while diff > math.pi: diff -= 2 * math.pi
         while diff < -math.pi: diff += 2 * math.pi
-        
+        diff = np.clip(diff, -3.0, 3.0) # Clip to ~170 degrees
         return diff
