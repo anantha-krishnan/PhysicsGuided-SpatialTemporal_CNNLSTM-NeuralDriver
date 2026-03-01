@@ -16,8 +16,8 @@ current_dir = current_file_path.parent
 CSV_FILE = current_dir.parent / "Map_Layouts" / "lane_change_dataset.csv"
 MODEL_SAVE_PATH = current_dir.parent / "Map_Layouts" / "lstm_driver.pth"
 SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.npz"
-# Feature and Target Columns
-feature_cols = ['cte_input', 'heading_error_input', 'yaw_rate_input','future_path_curvature_input']
+#feature_cols = ['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input','lat_accel_input','future_path_curvature_input']
+feature_cols = ['cte_input', 'heading_error_input', 'yaw_rate_input','future_path_curvature_input', 'future_heading_error_input']
 target_cols = ['steer_cmd']
 input_dim = len(feature_cols)
 output_dim = len(target_cols) # Steer, Longitudinal (Throttle-Brake)
@@ -29,9 +29,11 @@ LEARNING_RATE = 0.001
 SEQUENCE_LENGTH = 30    # 1 second history
 HIDDEN_SIZE = 64
 NUM_LAYERS = 2
+MIN_IMPROVEMENT_DELTA = 1e-6 
 
 WHEELBASE = 2.875
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # --- 1. UTILITY: EARLY STOPPING CLASS ---
 class EarlyStopping:
@@ -102,6 +104,7 @@ def create_sequences_from_df(df, seq_len):
         # Process Targets: [Steer, Throttle-Brake]
         steer = targets[:, 0]
         #long_cmd = targets[:, 1] - targets[:, 2]
+        long_cmd = 0
         processed_targets = steer.reshape(-1, 1)
         
         num_samples = len(data) - seq_len
@@ -125,7 +128,7 @@ def create_sequences_from_df(df, seq_len):
 class LSTMDriver(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super(LSTMDriver, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.1)
+        self.lstm = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.1)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.tanh = nn.Tanh()
 
@@ -185,8 +188,8 @@ class KinematicLSTMLoss(nn.Module):
         #physics_loss = torch.mean(friction_violation**2)
         
         # Combine: 
-        # penalty (0.35) because violating physics causes crashes
-        #return cloning_loss + (0.35 * physics_loss)
+        # Strong penalty (0.5) because violating physics causes crashes
+        #return cloning_loss + (0.0 * physics_loss)
         return cloning_loss
 
 # --- 5. TRAINING LOOP ---

@@ -12,6 +12,7 @@ import random
 from sklearn.preprocessing import StandardScaler
 from utility_fncs_train_inference import ControllerUtils
 from minimap import PygameVisualizer
+from controller import PathFollower
 from path_generators import (
     generate_straight_path,
     generate_90_degree_turn_path,
@@ -23,9 +24,10 @@ from path_generators import (
 # --- CONFIGURATION ---
 current_file_path = Path(os.path.abspath(__file__))
 current_dir = current_file_path.parent
-MODEL_SAVE_PATH = current_dir.parent / "Map_Layouts" / "lstm_driver.pth"
-SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.npz"
+MODEL_SAVE_PATH = current_dir.parent / "Map_Layouts" / "lstm_driver_lstm.pth"
+SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm_lstm.npz"
 XODR_DATA = current_dir.parent / "Map_Layouts" / "flattesttrack.xodr"
+csv_path = current_dir.parent / "Map_Layouts" / "new_waypoints_Processed.txt"
 MODEL_PATH = MODEL_SAVE_PATH
 SCALER_PATH = SCALER_SAVE_PATH
 SEQUENCE_LENGTH = 30    # Must match training
@@ -40,7 +42,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class LSTMDriver(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super(LSTMDriver, self).__init__()
-        self.lstm = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.1)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.1)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.tanh = nn.Tanh()
 
@@ -116,14 +118,16 @@ class NeuralController:
         #    throttle = 0.0
         #    brake = np.clip(abs(net_long), 0.0, 1.0)
         
-        return steer_cmd, 0.5, 0.0 # steer, throttle, brake
+        return steer_cmd, 0.35, 0.0 # steer, throttle, brake
 
 # --- 4. MAIN EXECUTION ---
 def main():
     
     client = carla.Client('localhost', 2000)
     client.set_timeout(10.0)
-    world = client.generate_opendrive_world(XODR_DATA.read_text())
+    #world = client.generate_opendrive_world(XODR_DATA.read_text())
+    #client.load_world('Town04')
+    world = client.get_world()
     # Sync Mode
     settings = world.get_settings()
     settings.synchronous_mode = True
@@ -131,7 +135,6 @@ def main():
     world.apply_settings(settings)
     
     bp = world.get_blueprint_library().filter('model3')[0]
-    
     # Initialize Neural Brain
     brain = NeuralController()
     try:
@@ -143,28 +146,33 @@ def main():
         target_y = 3.25 
         run_up = 30.0  
         run_out = 50.0 
+        ghost_path_speed = np.loadtxt(csv_path, delimiter=',', skiprows=1)
+        ghost_path_speed[:,3] = ghost_path_speed[:,3] / 2 # reduce speed by 2 for a more manageable test scenario.
+        controller = PathFollower(direct_data=ghost_path_speed)
         #ghost_path_speed = generate_lane_change_path(speed_kph=cruise_speed_kph, lc_length=lc_length, start_y=start_y, target_y=target_y, run_up=run_up, run_out=run_out)
         #ghost_path_speed = generate_straight_path(cruise_speed_kph, length=200.0)
-        turn_radius = random.uniform(15, 30) # City to rural road turn radius
-        ghost_path_speed = generate_90_degree_turn_path(cruise_speed_kph, turn_radius, 'left', run_out=run_out)
+        #turn_radius = random.uniform(15, 30) # City to rural road turn radius
+        #ghost_path_speed = generate_90_degree_turn_path(cruise_speed_kph, turn_radius, 'left', run_out=run_out)
         #ghost_path_speed = generate_hairpin_turn_path(cruise_speed_kph, turn_radius, 'right', run_out=run_out)
         #ghost_path_speed = generate_s_curve_path(cruise_speed_kph, turn_radius, 'right', run_out=run_out)
-        width = random.uniform(2.0, 4.0)   # Swerve 2-4 meters sideways
-        length = random.uniform(30.0, 50.0) # Complete the swerve in 30-50 meters
+        #width = random.uniform(2.0, 4.0)   # Swerve 2-4 meters sideways
+        #length = random.uniform(30.0, 50.0) # Complete the swerve in 30-50 meters
         #ghost_path_speed = generate_chicane_path(cruise_speed_kph, width, length, 'right', run_out=run_out)
-        print(f"Generating Scenario: {cruise_speed_kph} km/h, Turn Radius: {turn_radius:.1f}m, Width: {width:.1f}m, Length: {length:.1f}m")
+        #print(f"Generating Scenario: {cruise_speed_kph} km/h, Turn Radius: {turn_radius:.1f}m, Width: {width:.1f}m, Length: {length:.1f}m")
         visualizer = PygameVisualizer(window_size=(1000, 500))
+        ghost_path_speed[:,3] = ghost_path_speed[:,3] * 3.6 # Convert from m/s to km/h for visualization and control logic
         visualizer.set_path(ghost_path_speed)
+        ghost_path_speed[:,3] = ghost_path_speed[:,3] / 3.6 # Convert from km/h back to m/s for control logic
 
-        error_calc = ControllerUtils(data=ghost_path_speed, lookahead_dist=25.0)
+        error_calc = ControllerUtils(data=ghost_path_speed, lookahead_speed=True)
         # ghost_path=ghost_path_speed[:, :2]  # Extract only (x, y) for error calculations
         print(f"Generated Ghost Path with {len(ghost_path_speed)} points.")
         # Spawn at the start of the path
-        start_x, start_y = ghost_path_speed[0][0], ghost_path_speed[0][1]
-        start_pose = carla.Transform(carla.Location(x=start_x, y=start_y, z=0.5), carla.Rotation(yaw=0.0))
+        start_x, start_y, start_z = ghost_path_speed[0][0], ghost_path_speed[0][1], ghost_path_speed[0][2]
+        start_pose = carla.Transform(carla.Location(x=start_x, y=start_y, z=start_z+0.5), carla.Rotation(yaw=0.0))
         #start_pose = carla.Transform(carla.Location(x=10.0, y=-1.75, z=0.5), carla.Rotation(yaw=0.0))
         vehicle = world.spawn_actor(bp, start_pose)
-        
+        for _ in range(20): world.tick()
         # Spectator
         spectator = world.get_spectator()
         v_trans = vehicle.get_transform()
@@ -184,7 +192,7 @@ def main():
             
             # 2. Get State & Errors
             # speed, speed_error, cte, he, fut_cte, progress_idx = get_relative_errors(vehicle, ghost_path_speed)
-            cte, he, fut_cte, speed, speed_error, progress_idx, future_path_curvature = error_calc.calculate_relative_errors(vehicle)
+            cte, he, fut_cte, speed, speed_error, progress_idx, future_path_curvature, fut_yaw = error_calc.calculate_relative_errors(vehicle)
             # CARLA angular_velocity is in Degrees/s. Convert to Radians/s for training consistency.
             ang_vel_deg = vehicle.get_angular_velocity()
             yaw_rate = math.radians(ang_vel_deg.z)
@@ -196,32 +204,42 @@ def main():
             if progress_idx >= len(ghost_path_speed) - 5:
                 print("Track Complete!")
                 break
-                
+            #print(f"index: {progress_idx} | cte: {cte:.2f} | he: {he:.2f} | fut_cte: {fut_cte:.2f} | fut_yaw: {fut_yaw:.2f}")    
             # 3. AI Inference
-            steer, throttle, brake = brain.process(speed, speed_error, cte, he, fut_cte, yaw_rate, lat_accel, future_path_curvature)
+            steer, throttle, brake = brain.process(speed, speed_error, cte, he, fut_cte, yaw_rate, lat_accel, future_path_curvature, fut_yaw)
+            DAMPING_SPEED = 20.0 
+            damping_factor = 1.0 / (1.0 + (speed / DAMPING_SPEED))
+            
+            # Apply damping
+            nn_steer_damped = steer * damping_factor
+            # Long Control
+            sim_time = world.get_snapshot().timestamp.elapsed_seconds
+            throttle, brake = controller.get_long_vel(speed, ghost_path_speed[progress_idx][3], sim_time)
+            
             if cruise_speed_kph/3.6 > 1.0 and speed < 0.5 and throttle < 0.1:
-                print(">>> WATCHDOG TRIGGERED: Kicking car forward")
-                throttle = 0.3 # Force a gentle launch
+                print(">>> Car Stuck: Kicking car forward")
+                throttle = 0.3 
                 brake = 0.0
             # 4. Apply Control
             vehicle.apply_control(carla.VehicleControl(throttle=float(throttle), steer=float(steer), brake=float(brake)))
             
             # 5. Camera Follow
-            #v_trans = vehicle.get_transform()
-            #fwd_vec = v_trans.get_forward_vector()
-            #cam_loc = v_trans.location - (fwd_vec * 10.0) + carla.Location(z=5.0)
-            #
-            ## Rotate camera to look slightly down (-15 degrees)
-            #cam_rot = v_trans.rotation
-            #cam_rot.pitch = -15.0
-            #
-            #spectator.set_transform(carla.Transform(cam_loc, cam_rot))
+            v_trans = vehicle.get_transform()
+            fwd_vec = v_trans.get_forward_vector()
+            cam_loc = v_trans.location - (fwd_vec * 10.0) + carla.Location(z=5.0)
+            
+            # Rotate camera to look slightly down (-15 degrees)
+            cam_rot = v_trans.rotation
+            cam_rot.pitch = -15.0
+            
+            spectator.set_transform(carla.Transform(cam_loc, cam_rot))
             
             # Debug Print
             visualizer.render(vehicle, ghost_path_speed[progress_idx][3], speed)
             #print(f"progress_idx: {progress_idx} | Err: {cte:.2f}m | Fut: {fut_cte:.2f}m | Steer: {steer:.2f} | Thr: {throttle:.2f}")
 
     finally:
+        del controller
         vehicle.destroy()
         settings.synchronous_mode = False
         world.apply_settings(settings)

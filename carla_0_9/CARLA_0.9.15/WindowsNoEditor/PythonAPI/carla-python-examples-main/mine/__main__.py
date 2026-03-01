@@ -7,6 +7,8 @@ import sys
 import time
 import math
 import numpy as np
+import pandas as pd
+from scipy.interpolate import splprep, splev
 from pathlib import Path
 from controller import PathFollower
 try:
@@ -205,6 +207,111 @@ def gen_all_centerlines():
         print(f"Fatal Error: {e}")
         print("Ensure CARLA is running.")
 
+def smoothen_way_points(waypoints=None, input_csv="new_waypoints.txt", output_csv="new_waypoints_Processed.txt"):
+    """
+    Update the waypoints to match resolution of 0.5m as used in training data.    
+    Uses B Splines to create a smooth path through the original waypoints, then samples new points every 0.5m along the curve.
+    """
+    INPUT_CSV = input_csv  # Your current file
+    OUTPUT_CSV = output_csv # The file to use in neural_driver.py
+    TARGET_RESOLUTION = 0.5
+    print(f"Loading {INPUT_CSV}...")
+    # Load data (Assuming no header, or skiprows if needed)
+    # Adjust column names based on your file structure
+    # Based on your snippet: x, y, z, speed
+    if waypoints is None:
+        try:
+            df = pd.read_csv(INPUT_CSV)
+            # rename columns to standard names
+            df.columns = ['x', 'y', 'z', 'speed']
+        except:
+            print(f"Error loading {INPUT_CSV}. Ensure it exists and has the correct format.")
+            return
+    else:
+        df = pd.DataFrame(waypoints, columns=['x', 'y', 'z', 'speed'])
+
+    raw_len = len(df)
+    print(f"Original points: {raw_len}")
+
+    # 1. PRE-FILTERING: Remove points that are too close (car stopped or barely moving)
+    # This prevents the Spline from going crazy with knotted loops
+    clean_data = []
+    prev_x, prev_y = -99999, -99999
+    
+    for i in range(len(df)):
+        curr_x = df.iloc[i]['x']
+        curr_y = df.iloc[i]['y']
+        print(f"Processing point {i+1}/{len(df)}: ({curr_x}, {curr_y}), prev: ({prev_x}, {prev_y})")
+        dist = np.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
+        
+        # Keep point only if it moved at least 0.1m from the last kept point
+        if dist > 0.1: 
+            clean_data.append(df.iloc[i].values)
+            prev_x, prev_y = curr_x, curr_y
+            
+    clean_data = np.array(clean_data)
+    print(f"Points after distance filtering: {len(clean_data)}")
+
+    if len(clean_data) < 10:
+        print("Error: Not enough points remaining to interpolate!")
+        return
+
+    # Extract arrays
+    x = clean_data[:, 0]
+    y = clean_data[:, 1]
+    z = clean_data[:, 2]
+    speed = clean_data[:, 3]
+
+    # 2. FIT SPLINE
+    # s is the smoothing factor. 
+    # s=0.0 means "pass through every point" (noisy).
+    # s=5.0 allows the spline to ignore small jitters (smooth).
+    tck, u = splprep([x, y, z], s=2.0) 
+
+    # 3. RESAMPLE AT 0.5 METERS
+    # We first generate a fine line to measure distance
+    u_fine = np.linspace(0, 1, len(x) * 10)
+    x_fine, y_fine, z_fine = splev(u_fine, tck)
+    
+    # Calculate cumulative distance along the fine path
+    dist_steps = np.sqrt(np.diff(x_fine)**2 + np.diff(y_fine)**2)
+    cum_dist = np.insert(np.cumsum(dist_steps), 0, 0)
+    total_length = cum_dist[-1]
+    
+    print(f"Total Track Length: {total_length:.2f} meters")
+    
+    # Create target distances: 0, 0.5, 1.0, 1.5 ...
+    target_distances = np.arange(0, total_length, TARGET_RESOLUTION)
+    
+    # Interpolate X, Y, Z at these exact distances
+    x_final = np.interp(target_distances, cum_dist, x_fine)
+    y_final = np.interp(target_distances, cum_dist, y_fine)
+    z_final = np.interp(target_distances, cum_dist, z_fine)
+    
+    # Interpolate Speed (Linear) - Spline for speed can overshoot to negative values
+    # We map the original speeds to the new distances
+    # Estimate distance of original cleaned points
+    orig_dist_steps = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
+    orig_cum_dist = np.insert(np.cumsum(orig_dist_steps), 0, 0)
+    
+    speed_final = np.interp(target_distances, orig_cum_dist, speed)
+
+    # 4. SAVE
+    output_data = np.column_stack((x_final, y_final, z_final, speed_final))
+    
+    # Save with header
+    np.savetxt(OUTPUT_CSV, output_data, delimiter=',', header="x,y,z,speed", comments='')
+    print(f"Saved processed route to {OUTPUT_CSV}")
+    print(f"Final point count: {len(output_data)}")
+
+    # Optional: Plot to check smoothness
+    plt.figure(figsize=(10, 6))
+    plt.plot(x, y, 'r.', label='Original (Filtered)', markersize=2)
+    plt.plot(x_final, y_final, 'b-', label='Splined & Resampled', linewidth=1)
+    plt.legend()
+    plt.title("Path Processing Result")
+    plt.axis('equal')
+    plt.show()
 
 def generate_way_points():
     pygame.init()
@@ -607,4 +714,8 @@ def auto_driver():
 
 
 if __name__ == '__main__':
-    auto_driver()
+    generate_way_points()
+    smoothen_way_points(input_csv=os.path.join(output_folder, "new_waypoints.txt"), output_csv=os.path.join(output_folder, "new_waypoints_Processed.txt"))
+
+# cd D:\PaperWork\personal\AI\LLM_Engg_GenAI_Rag_Lora_Agent\personal_works\MS\Driver\carla_0_9\CARLA_0.9.15\WindowsNoEditor\PythonAPI\util
+# python config.py --map Town04

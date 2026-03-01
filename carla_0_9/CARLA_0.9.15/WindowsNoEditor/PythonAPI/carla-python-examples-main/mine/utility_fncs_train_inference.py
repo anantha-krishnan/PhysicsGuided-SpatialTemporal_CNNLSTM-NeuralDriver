@@ -3,20 +3,17 @@
 import numpy as np
 import math
 class ControllerUtils:
-    def __init__(self, data=None, lookahead_time=None, lookahead_dist=None, resolution=0.5):
+    def __init__(self, data=None, lookahead_speed=None, lookahead_dist=None, resolution=0.5):
         self.waypoints_xy = data[:, 0:2] if data is not None else None
         self.target_speed = data[:, 3] if data is not None else None
         self.last_closest_idx = 0
         self.resolution = resolution # Meters between waypoints, used for lookahead index calculation
-        if lookahead_time and lookahead_dist:
-            raise ValueError("Both lookahead_time and lookahead_dist cannot be provided together.")
-        elif not lookahead_time and not lookahead_dist:
-            raise ValueError("Either lookahead_time or lookahead_dist must be provided.")
+        if lookahead_speed and lookahead_dist:
+            raise ValueError("Both lookahead_speed and lookahead_dist cannot be provided together.")
+        elif not lookahead_speed and not lookahead_dist:
+            raise ValueError("Either lookahead_speed or lookahead_dist must be provided.")
         elif lookahead_dist:
             self.lookahead_pts = int(lookahead_dist / self.resolution)
-        elif lookahead_time:
-            self.lookahead_pts = int(self.target_speed[0] * lookahead_time / self.resolution)
-        self.lookahead_time = lookahead_time
         self.lookahead_dist = lookahead_dist
         
     def get_cte(self, vehicle, closest_pt_on_path, next_pt_on_path):
@@ -63,15 +60,17 @@ class ControllerUtils:
         # Current Speed
         vel = vehicle.get_velocity()
         speed = math.sqrt(vel.x**2 + vel.y**2)
-        # Find closest point based on lookahead_dist or lookahead_time
+        # Find closest point based on lookahead_dist or lookahead_speed
         search_start = self.last_closest_idx
         # lookahead_dist
         if self.lookahead_dist:
             search_end = min(self.last_closest_idx + self.lookahead_pts, len(path_points))
-        # lookahead_time
+        # lookahead_speed
         else:
-            lookahead_pts_time = int((speed * self.lookahead_time) / self.resolution)
-            search_end = min(self.last_closest_idx + lookahead_pts_time, len(path_points))
+            speed_temp = max(speed, 3) # Avoid division by zero
+            lookahead_dist = speed_temp * 1.0 # Look 1 second ahead
+            lookahead_pts_speed = int(lookahead_dist / self.resolution)              
+            search_end = min(self.last_closest_idx + lookahead_pts_speed, len(path_points))
         search_points = path_points[search_start:search_end, :2]
         if len(search_points) < 5:
             print("Warning: Not enough points in search window for error calculation. End of track may be near.")
@@ -79,7 +78,6 @@ class ControllerUtils:
         dists = np.linalg.norm(search_points - np.array([v_loc.x, v_loc.y]), axis=1)
         min_idx = np.argmin(dists) + search_start        
         closest_pt = path_points[min_idx]
-        
         # 1. Lateral Error (CTE)
         # For this X-aligned map, CTE is simply (y_car - y_path)
         # Note: We need to respect sign relative to path direction.
