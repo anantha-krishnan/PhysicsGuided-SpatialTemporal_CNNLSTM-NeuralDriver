@@ -48,8 +48,8 @@ def list_maps():
         print(f"Details: {e}")
 
 # --- CONFIGURATION ---
-WINDOW_WIDTH = 800
-WINDOW_HEIGHT = 600
+WINDOW_WIDTH = 1000
+WINDOW_HEIGHT = 800
 MAP_SIZE = 200        # Pixel size of the mini-map (square)
 MAP_OPACITY = 200     # 0-255 (255 is solid, <255 is transparent)
 STEER_SPEED = 0.01      # How fast the wheel turns (0.01 = slow, 0.1 = fast)
@@ -357,7 +357,7 @@ def generate_way_points():
         camera_bp.set_attribute('image_size_x', str(WINDOW_WIDTH))
         camera_bp.set_attribute('image_size_y', str(WINDOW_HEIGHT))
         camera_bp.set_attribute('fov', '100')
-        camera_transform = carla.Transform(carla.Location(x=-5.5, z=2.5), carla.Rotation(pitch=-15))
+        camera_transform = carla.Transform(carla.Location(x=-5.5, z=5.0), carla.Rotation(pitch=-25))
         camera = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
         actor_list.append(camera)
         camera.listen(lambda image: parse_image(display, image))
@@ -715,7 +715,7 @@ def auto_driver():
 
 if __name__ == '__main__':
     generate_way_points()
-    smoothen_way_points(input_csv=os.path.join(output_folder, "new_waypoints.txt"), output_csv=os.path.join(output_folder, "new_waypoints_Processed.txt"))
+    smoothen_way_points(input_csv=os.path.join(output_folder, "new_waypoints.txt"), output_csv=os.path.join(output_folder, "new_waypoints_Processed_town10HD_2.txt"))
 
 # cd D:\PaperWork\personal\AI\LLM_Engg_GenAI_Rag_Lora_Agent\personal_works\MS\Driver\carla_0_9\CARLA_0.9.15\WindowsNoEditor\PythonAPI\util
 # python config.py --map Town04

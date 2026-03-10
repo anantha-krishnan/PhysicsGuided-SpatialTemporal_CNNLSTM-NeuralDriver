@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.model_selection import train_test_split
 from pathlib import Path
 import os
@@ -17,7 +17,8 @@ CSV_FILE = current_dir.parent / "Map_Layouts" / "lane_change_dataset.csv"
 MODEL_SAVE_PATH = current_dir.parent / "Map_Layouts" / "lstm_driver.pth"
 SCALER_SAVE_PATH = current_dir.parent / "Map_Layouts" / "scaler_lstm.npz"
 #feature_cols = ['speed_input', 'speed_error_input', 'cte_input', 'heading_error_input', 'future_cte_input', 'yaw_rate_input','lat_accel_input','future_path_curvature_input']
-feature_cols = ['cte_input', 'heading_error_input', 'yaw_rate_input','future_path_curvature_input', 'future_heading_error_input']
+feature_cols = ['cte_input', 'heading_error_input', 'yaw_rate_input','future_path_curvature_input', 'future_heading_error_input',
+                'wp_0_x','wp_0_y','wp_1_x','wp_1_y','wp_2_x','wp_2_y','wp_3_x','wp_3_y','wp_4_x','wp_4_y','wp_5_x','wp_5_y','wp_6_x','wp_6_y','wp_7_x','wp_7_y','wp_8_x','wp_8_y','wp_9_x','wp_9_y']
 target_cols = ['steer_cmd']
 input_dim = len(feature_cols)
 output_dim = len(target_cols) # Steer, Longitudinal (Throttle-Brake)
@@ -136,6 +137,82 @@ class LSTMDriver(nn.Module):
         out, _ = self.lstm(x)
         last_out = out[:, -1, :] 
         return self.tanh(self.fc(last_out))
+class LSTM1DCNNDriver(nn.Module):
+    def __init__(self, state_dim, num_waypoints, hidden_dim, output_dim, num_layers=2):
+        super(LSTM1DCNNDriver, self).__init__()
+        self.state_dim = state_dim
+        self.num_waypoints = num_waypoints
+        # --- 1. STATE ENCODER (Current Kinematics) ---
+        # Input: [CTE, Heading_Err, Yaw_Rate, Future_Curv, Future_Heading_Err]
+        # We expand 5 inputs -> 64 features using Tanh to preserve -1 to 1 symmetry.
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh()
+        )
+        # --- 2. WAYPOINT ENCODER (1D Spatial CNN Future Path) ---
+        # Input: 10 waypoints (x,y) = 20 features
+        # Goal: Extract geometry (Curves, S-Turns) but compress to 16 features
+        self.wp_encoder = nn.Sequential(
+            # Layer 1: Curvature Detector (Window of 3 points)
+            # Input: (Batch*Seq, 2, 10) -> Output: (Batch*Seq, 8, 10)
+            nn.Conv1d(in_channels=2, out_channels=8, kernel_size=3, padding=1), # 10 -> 10, 2->8
+            nn.Tanh(),
+            # Layer 2: S-Turn Detector (Window of 3 points)
+            # Input: (Batch*Seq, 8, 10) -> Output: (Batch*Seq, 16, 10)
+            nn.Conv1d(in_channels=8, out_channels=16, kernel_size=3, padding=1), # 10 -> 10, 8->16
+            nn.Tanh(),
+            # effectively captures local geometric patterns in the waypoints while maintaining the sequence length
+            # it now has 5 point window curvature similar to akima spline
+            # Layer 3: Compression (The "1/3rd Rule")
+            nn.Flatten(), # (Batch*Seq, 16*10) = (Batch*Seq, 160)
+            nn.Linear(16 * num_waypoints, 32), # 160 -> 32
+            nn.Tanh()
+        )
+        # --- 3. FUSION & DECODER ---
+        # Combine State (64) + Waypoint (32) = 96 features
+        # LSTM Decoder: 96 -> Hidden -> 32
+        # Combined Dimension = 64 (State) + 32 (Map) = 96
+        combined_dim = 64 + 32
+        self.lstm = nn.GRU(combined_dim, hidden_dim, num_layers, batch_first=True, dropout=0.1)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.tanh = nn.Tanh()
+    
+    def forward(self, x):
+        # x shape: (Batch, Sequence_Length, Total_Features)
+        batch_size, seq_len, total_features = x.size()
+        # --- 1. SPLIT STATE & WAYPOINTS ---
+        state_x  = x[:, :, :self.state_dim] # (Batch, Seq, State_Dim)
+        wp_x  = x[:, :, self.state_dim:] # (Batch, Seq, Waypoint_Dim)
+        # --- B. The "Batch*Seq" Folding ---
+        # Merge Batch and Seq so CNN/Linear layers treat every timestep as an independent sample
+        state_x = state_x.contiguous().view(batch_size * seq_len, self.state_dim)
+        # Prepare Waypoints for Conv1d (Needs Channels in middle)
+        # 1. Reshape to (Batch*Seq, 10 points, 2 coords)
+        wp_x = wp_x.contiguous().view(batch_size * seq_len, self.num_waypoints, 2)
+        # 2. Permute to (Batch*Seq, 2 coords, 10 points)
+        wp_x = wp_x.permute(0, 2, 1)
+        
+        # --- C. Extract Features ---
+        state_features = self.state_encoder(state_x)    # Shape: (Batch*Seq, 64)
+        wp_features = self.wp_encoder(wp_x)             # Shape: (Batch*Seq, 16)
+        
+        # --- D. Feature Fusion ---
+        # Concatenate side-by-side: [State (64) | Map (16)]
+        combined_features = torch.cat((state_features, wp_features), dim=1) # Shape: (Batch*Seq, 80)
+        
+        # --- E. Restore Sequence Dimension ---
+        # Unfold back to (Batch, Seq, 80) so GRU sees the time history
+        combined_features = combined_features.view(batch_size, seq_len, -1)
+        
+        # --- F. Temporal Processing ---
+        out, _ = self.lstm(combined_features)
+        
+        # Take the output of the LAST time step
+        last_out = out[:, -1, :] 
+        
+        # Generate Steering Command
+        return self.tanh(self.fc(last_out))
+
 
 # --- 4. PHYSICS LOSS ---
 class KinematicLSTMLoss(nn.Module):
@@ -145,14 +222,18 @@ class KinematicLSTMLoss(nn.Module):
         self.L = WHEELBASE
         
         
-        self.scaler_mean = torch.tensor(scaler.mean_, dtype=torch.float32).to(device)
+        #self.scaler_mean = torch.tensor(scaler.mean_, dtype=torch.float32).to(device)
+        self.scaler_center = torch.tensor(scaler.center_, dtype=torch.float32).to(device)
         self.scaler_scale = torch.tensor(scaler.scale_, dtype=torch.float32).to(device)
+        
 
     def forward(self, predictions, targets, inputs_scaled):
         
         # --- 1. CLONING LOSS (Imitation) ---
-        cloning_loss = self.mse(predictions, targets)
-        
+        #cloning_loss = self.mse(predictions, targets)
+        base_loss = (predictions-targets)**2
+        weights=1+(5*torch.abs(targets))
+        weighted_loss = torch.mean(base_loss * weights)
         # --- 2. PHYSICS PREPARATION ---
         # Unscale inputs to get real Speed (m/s)
         #real_inputs = (inputs_scaled * self.scaler_scale) + self.scaler_mean
@@ -190,7 +271,7 @@ class KinematicLSTMLoss(nn.Module):
         # Combine: 
         # Strong penalty (0.5) because violating physics causes crashes
         #return cloning_loss + (0.0 * physics_loss)
-        return cloning_loss
+        return weighted_loss
 
 # --- 5. TRAINING LOOP ---
 def train():
@@ -208,14 +289,15 @@ def train():
     print(f"Train Episodes: {len(train_eps)} | Val Episodes: {len(val_eps)}")
 
     # B. FIT SCALER ON TRAINING DATA ONLY (Prevent Data Leakage)
-    scaler = StandardScaler()
+    scaler = RobustScaler()
     
     # Fit on Train, Transform both
     train_df[feature_cols] = scaler.fit_transform(train_df[feature_cols])
     val_df[feature_cols] = scaler.transform(val_df[feature_cols])
     feature_names = train_df[feature_cols].columns.to_list()
 
-    np.savez(SCALER_SAVE_PATH, mean=scaler.mean_, scale=scaler.scale_, feature_names=feature_names)
+    #np.savez(SCALER_SAVE_PATH, mean=scaler.mean_, scale=scaler.scale_, feature_names=feature_names)
+    np.savez(SCALER_SAVE_PATH, center=scaler.center_, scale=scaler.scale_, feature_names=feature_names)
     
     # C. CREATE SEQUENCES
     print("Generating Sequences...")
@@ -230,7 +312,13 @@ def train():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
     
     # E. MODEL SETUP
-    model = LSTMDriver(input_dim=input_dim, hidden_dim=HIDDEN_SIZE, output_dim=output_dim).to(device)
+    #model = LSTMDriver(input_dim=input_dim, hidden_dim=HIDDEN_SIZE, output_dim=output_dim).to(device)
+    model = LSTM1DCNNDriver(
+        state_dim=5,         # 5
+        num_waypoints=10, # 10
+        hidden_dim=HIDDEN_SIZE,      # 64
+        output_dim=output_dim        # 1
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     loss_fn = KinematicLSTMLoss(scaler)
     
@@ -286,8 +374,14 @@ def get_model_architecture():
     import os
     
     # 1. Re-initialize model
-    model = LSTMDriver(input_dim=input_dim, hidden_dim=HIDDEN_SIZE, output_dim=output_dim).to(device)
-    dummy_input = torch.randn(BATCH_SIZE, SEQUENCE_LENGTH, input_dim).to(device)
+    #model = LSTMDriver(input_dim=input_dim, hidden_dim=HIDDEN_SIZE, output_dim=output_dim).to(device)
+    model = LSTM1DCNNDriver(
+        state_dim=5,         # 5
+        num_waypoints=10, # 10
+        hidden_dim=HIDDEN_SIZE,      # 64
+        output_dim=output_dim        # 1
+    ).to(device)
+    dummy_input = torch.randn(1, 2, input_dim).to(device)
 
     print("\n" + "="*30)
     print("     GENERATING HIGH-RES CHART")
@@ -299,7 +393,7 @@ def get_model_architecture():
     # 3. Create Graph
     # show_attrs=True: Shows the dimensions inside the boxes (Crucial)
     # show_saved=True: Shows memory cells
-    dot = make_dot(output, params=dict(model.named_parameters()), show_attrs=True, show_saved=True)
+    dot = make_dot(output, params=dict(model.named_parameters()), show_attrs=False, show_saved=False)
     
     # --- SETTINGS FOR QUALITY ---
     dot.attr(rankdir='LR')       # Left-to-Right orientation
@@ -331,7 +425,74 @@ def get_model_architecture():
         print("\n!!! WARNING: The generated file is empty (0kb).")
         print("This usually means 'Graphviz' is not installed on your system.")
         print("Please install it: https://graphviz.org/download/")
+def get_model_architecture_simple():
+    from torchview import draw_graph
+    import os
     
+    save_dir = current_dir.parent / "Map_Layouts"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 1. Re-initialize model
+    model = LSTM1DCNNDriver(
+        state_dim=5,         
+        num_waypoints=10, 
+        hidden_dim=HIDDEN_SIZE,      
+        output_dim=output_dim        
+    ).to(device)
+
+    print("\n" + "="*30)
+    print("     GENERATING CLEAN ARCHITECTURE CHART")
+    print("="*30)
+
+    # 2. Draw Graph using torchview
+    # We use a small batch/seq size just to trace the layers
+    model_graph = draw_graph(
+        model, 
+        input_size=(1, 2, input_dim), # (Batch, Seq, Features)
+        device=device,
+        graph_name="LSTM1DCNNDriver",
+        expand_nested=True,        # Expands nn.Sequential blocks
+        save_graph=True,           # Will save to file
+        directory=str(save_dir),   # Save location
+        filename="architecture_clean" # Output name
+    )
+    
+    print(f"[SUCCESS] Saved clean architecture chart to {save_dir}/architecture_clean.png")
+def get_model_architecture_onnx():
+    import os
+    
+    save_dir = current_dir.parent / "Map_Layouts"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 1. Re-initialize model
+    model = LSTM1DCNNDriver(
+        state_dim=5,         
+        num_waypoints=10, 
+        hidden_dim=HIDDEN_SIZE,      
+        output_dim=output_dim        
+    ).to(device)
+
+    dummy_input = torch.randn(BATCH_SIZE, SEQUENCE_LENGTH, input_dim).to(device)
+    onnx_path = save_dir / "LSTM1DCNNDriver.onnx"
+
+    print("\n" + "="*30)
+    print("     EXPORTING ONNX FOR NETRON")
+    print("="*30)
+
+    # Export to ONNX format
+    torch.onnx.export(
+        model, 
+        dummy_input, 
+        onnx_path, 
+        export_params=True, 
+        opset_version=11,          # Standard ONNX opset
+        do_constant_folding=True,  # Optimizes graph for viewing
+        input_names=['input_KS_Path'], 
+        output_names=['steer_command']
+    )
+    
+    print(f"[SUCCESS] Saved ONNX model to {onnx_path}")
+    print(">>> Next Step: Drag and drop this file into https://netron.app to see the beautiful architecture diagram! <<<")
 if __name__ == "__main__":
-    get_model_architecture()
-    train()
+    get_model_architecture_onnx()
+    #train()

@@ -124,7 +124,70 @@ class ControllerUtils:
         self.last_closest_idx = min_idx
 
         return cte, he, future_cte, speed, speed_error, self.last_closest_idx, future_path_curvature, fut_yaw
-    
+
+    def get_local_waypoints_dynamic(self, vehicle, num_points=10, path_resolution=0.5):
+        """
+        Returns a flat list [x0, y0, x1, y1, ...] of future waypoints transformed 
+        into the vehicle's local coordinate frame.
+        
+        Includes Dynamic Lookahead (1.0s horizon) based on speed.
+        """
+        closest_idx = self.last_closest_idx
+        # 1. Get Vehicle State
+        v_trans = vehicle.get_transform()
+        v_x = v_trans.location.x
+        v_y = v_trans.location.y
+        v_yaw_rad = math.radians(v_trans.rotation.yaw)
+        
+        # 2. Get Speed for Dynamic Lookahead
+        vel = vehicle.get_velocity()
+        speed_ms = math.sqrt(vel.x**2 + vel.y**2)
+        
+        # --- DYNAMIC HORIZON LOGIC ---
+        # Look ahead 1.0 second. 
+        # Clamp: Min 5m (for low speed stability), Max 40m (sensor limit)
+        lookahead_dist = np.clip(speed_ms * 1.0, 5.0, 100.0)
+        
+        # Calculate step size based on your 0.5m path resolution
+        # Example: At 20m/s, lookahead is 20m. We want 10 points. 
+        # Spacing = 2m. Step = 2m / 0.5m = 4 indices.
+        step_meters = lookahead_dist / num_points
+        step = int(max(1, round(step_meters / path_resolution)))
+        # -----------------------------
+
+        # Pre-calculate rotation matrix terms
+        cos_a = math.cos(v_yaw_rad)
+        sin_a = math.sin(v_yaw_rad)
+        
+        local_waypoints = []
+        max_len = len(self.waypoints_xy)
+
+        for i in range(num_points):
+            # Calculate the target index using the dynamic step
+            idx = closest_idx + (i * step)
+            
+            # Handle end of path (repeat last point if we run out)
+            if idx >= max_len:
+                idx = max_len - 1
+                
+            # Get Global Point
+            # Assuming global_path_points is a list of [x, y] or [x, y, z]
+            pt = self.waypoints_xy[idx]
+            gx, gy = pt[0], pt[1]
+            
+            # --- COORDINATE TRANSFORMATION ---
+            # A. Translate (Shift origin to car)
+            dx = gx - v_x
+            dy = gy - v_y
+            
+            # B. Rotate (Align X-axis with car heading)
+            # Local X = Forward, Local Y = Left/Right
+            local_x = (dx * cos_a) + (dy * sin_a)
+            local_y = (-dx * sin_a) + (dy * cos_a)
+            
+            local_waypoints.extend([local_x, local_y])
+            
+        return local_waypoints
     def calculate_min_radius(self, start_idx, end_idx):
         """
         Scans the path ahead to find the sharpest curve and returns its radius.
