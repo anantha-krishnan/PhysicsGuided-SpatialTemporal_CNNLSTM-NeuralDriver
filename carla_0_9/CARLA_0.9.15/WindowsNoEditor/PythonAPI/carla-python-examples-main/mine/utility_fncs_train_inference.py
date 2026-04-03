@@ -125,7 +125,7 @@ class ControllerUtils:
 
         return cte, he, future_cte, speed, speed_error, self.last_closest_idx, future_path_curvature, fut_yaw
 
-    def get_local_waypoints_dynamic(self, vehicle, num_points=10, path_resolution=0.5):
+    def get_local_waypoints_dynamic(self, vehicle, num_points=10, path_resolution=0.5, lookahead_dis=None):
         """
         Returns a flat list [x0, y0, x1, y1, ...] of future waypoints transformed 
         into the vehicle's local coordinate frame.
@@ -146,7 +146,7 @@ class ControllerUtils:
         # --- DYNAMIC HORIZON LOGIC ---
         # Look ahead 1.0 second. 
         # Clamp: Min 5m (for low speed stability), Max 40m (sensor limit)
-        lookahead_dist = np.clip(speed_ms * 1.0, 5.0, 100.0)
+        lookahead_dist = np.clip(speed_ms * 1.0, 5.0, 100.0) if lookahead_dis is None else lookahead_dis
         
         # Calculate step size based on your 0.5m path resolution
         # Example: At 20m/s, lookahead is 20m. We want 10 points. 

@@ -222,18 +222,18 @@ class KinematicLSTMLoss(nn.Module):
         self.L = WHEELBASE
         
         
-        #self.scaler_mean = torch.tensor(scaler.mean_, dtype=torch.float32).to(device)
-        self.scaler_center = torch.tensor(scaler.center_, dtype=torch.float32).to(device)
+        self.scaler_mean = torch.tensor(scaler.mean_, dtype=torch.float32).to(device)
+        #self.scaler_center = torch.tensor(scaler.center_, dtype=torch.float32).to(device)
         self.scaler_scale = torch.tensor(scaler.scale_, dtype=torch.float32).to(device)
         
 
     def forward(self, predictions, targets, inputs_scaled):
         
         # --- 1. CLONING LOSS (Imitation) ---
-        #cloning_loss = self.mse(predictions, targets)
-        base_loss = (predictions-targets)**2
-        weights=1+(5*torch.abs(targets))
-        weighted_loss = torch.mean(base_loss * weights)
+        cloning_loss = self.mse(predictions, targets)
+        #base_loss = (predictions-targets)**2
+        #weights=1+(5*torch.abs(targets))
+        #weighted_loss = torch.mean(base_loss * weights)
         # --- 2. PHYSICS PREPARATION ---
         # Unscale inputs to get real Speed (m/s)
         #real_inputs = (inputs_scaled * self.scaler_scale) + self.scaler_mean
@@ -271,7 +271,7 @@ class KinematicLSTMLoss(nn.Module):
         # Combine: 
         # Strong penalty (0.5) because violating physics causes crashes
         #return cloning_loss + (0.0 * physics_loss)
-        return weighted_loss
+        return cloning_loss
 
 # --- 5. TRAINING LOOP ---
 def train():
@@ -289,15 +289,16 @@ def train():
     print(f"Train Episodes: {len(train_eps)} | Val Episodes: {len(val_eps)}")
 
     # B. FIT SCALER ON TRAINING DATA ONLY (Prevent Data Leakage)
-    scaler = RobustScaler()
+    #scaler = RobustScaler()
+    scaler = StandardScaler()
     
     # Fit on Train, Transform both
     train_df[feature_cols] = scaler.fit_transform(train_df[feature_cols])
     val_df[feature_cols] = scaler.transform(val_df[feature_cols])
     feature_names = train_df[feature_cols].columns.to_list()
 
-    #np.savez(SCALER_SAVE_PATH, mean=scaler.mean_, scale=scaler.scale_, feature_names=feature_names)
-    np.savez(SCALER_SAVE_PATH, center=scaler.center_, scale=scaler.scale_, feature_names=feature_names)
+    np.savez(SCALER_SAVE_PATH, mean=scaler.mean_, scale=scaler.scale_, feature_names=feature_names)
+    #np.savez(SCALER_SAVE_PATH, center=scaler.center_, scale=scaler.scale_, feature_names=feature_names)
     
     # C. CREATE SEQUENCES
     print("Generating Sequences...")

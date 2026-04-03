@@ -2,13 +2,13 @@
 import pygame
 import numpy as np
 from collections import deque
-
+import csv
 # ==============================================================================
 # -- PygameVisualizer ----------------------------------------------------------
 # ==============================================================================
 
 class PygameVisualizer:
-    def __init__(self, window_size=(800, 400), background_color=(28, 28, 28)):
+    def __init__(self, window_size=(800, 400), background_color=(28, 28, 28), log_frame=False):
         pygame.init()
         self.width, self.height = window_size
         self.screen = pygame.display.set_mode(window_size, pygame.RESIZABLE)
@@ -16,7 +16,7 @@ class PygameVisualizer:
         self.font = pygame.font.Font(None, 24)
         self.small_font = pygame.font.Font(None, 20)
         self.background_color = background_color
-        
+        self.log_frame=log_frame
         # --- Dynamic Layout Calculation ---
         margin = 20
         gap = 20
@@ -33,14 +33,26 @@ class PygameVisualizer:
         plot_bottom_margin = 30
         plot_area_height = self.height - plot_top_margin - plot_bottom_margin
         
-        # Split vertical space for two plots (Velocity and Steering)
+        #split vertical space for THREE plots: Velocity, Steering, CTE
         plot_gap = 70 # Space between the two plots to fit legends and titles
-        single_plot_height = (plot_area_height - plot_gap) // 2
+        single_plot_height = (plot_area_height - 2 * plot_gap) // 3
         
         # Rectangles for plotting areas
         self.vel_plot_rect = pygame.Rect(plot_left, plot_top_margin, plot_width, single_plot_height)
-        self.steer_plot_rect = pygame.Rect(plot_left, self.vel_plot_rect.bottom + plot_gap, plot_width, single_plot_height)
-        
+
+        self.steer_plot_rect = pygame.Rect(
+            plot_left,
+            self.vel_plot_rect.bottom + plot_gap,
+            plot_width,
+            single_plot_height,
+        )
+
+        self.cte_plot_rect = pygame.Rect(
+            plot_left,
+            self.steer_plot_rect.bottom + plot_gap,
+            plot_width,
+            single_plot_height,
+        )
         # --- Minimap Data ---
         self.world_path = None
         self.screen_path = None
@@ -54,6 +66,15 @@ class PygameVisualizer:
         self.target_vel_history = deque(maxlen=history_len)
         self.actual_vel_history = deque(maxlen=history_len)
         self.steer_history = deque(maxlen=history_len) # NEW: Steering history
+        self.cte_history = deque(maxlen=history_len) # NEW: CTE history
+        self.CTE_PLOT_MAX = 10.0 # +/- meters — adjust as needed
+        
+        self.log_file = open("telemetry_log.csv", "w", newline="")
+        self.log_writer = csv.writer(self.log_file)
+
+        # Header row
+        self.log_writer.writerow(["target_vel_ms", "actual_vel_ms", "steer", "cte", "he", "fut_yaw", "future_path_curvature", "yaw_rate"])
+        self.log_file.flush()
 
     def set_path(self, ghost_path):
         """Pre-calculates the transformation for the minimap."""
@@ -217,17 +238,81 @@ class PygameVisualizer:
             
             self.screen.blit(text_surf, text_rect)
 
-    # ---> CHANGED: Added `steer` to the render signature
-    def render(self, vehicle, target_vel_ms, actual_vel_ms, steer=0.0):
+    def _draw_cte_plot(self):
+        """Draws the Cross Track Error graph section."""
+        pygame.draw.rect(self.screen, (40, 40, 40),
+                        self.cte_plot_rect.inflate(20, 40), border_radius=5)
+
+        # Title
+        title = self.font.render("Cross Track Error (m)", True, (255, 255, 255))
+        self.screen.blit(
+            title,
+            (self.cte_plot_rect.centerx - title.get_width() // 2,
+            self.cte_plot_rect.top - 30)
+        )
+
+        # Axes
+        pygame.draw.line(self.screen, (150, 150, 150),
+                        self.cte_plot_rect.bottomleft, self.cte_plot_rect.topleft, 2)
+        pygame.draw.line(self.screen, (150, 150, 150),
+                        self.cte_plot_rect.bottomleft, self.cte_plot_rect.bottomright, 2)
+
+        max_cte = self.CTE_PLOT_MAX
+        min_cte = -self.CTE_PLOT_MAX
+
+        # Grid lines every 1m
+        grid_color = (70, 70, 70)
+        for val in np.linspace(min_cte, max_cte, 5):  # -max, -half, 0, half, +max
+            y = self.cte_plot_rect.bottom - int(((val - min_cte)/(max_cte-min_cte)) *
+                                                self.cte_plot_rect.height)
+            pygame.draw.line(self.screen, grid_color,
+                            (self.cte_plot_rect.left, y),
+                            (self.cte_plot_rect.right, y), 1)
+            label = self.small_font.render(f"{val:.1f}", True, (200, 200, 200))
+            self.screen.blit(label, (self.cte_plot_rect.left - 32, y - 8))
+
+        # Draw CTE line
+        if len(self.cte_history) > 1:
+            points = []
+            for i, c in enumerate(self.cte_history):
+                c = max(min_cte, min(max_cte, c))  # clamp
+                x = self.cte_plot_rect.left + i
+                y = self.cte_plot_rect.bottom - int(((c - min_cte) /
+                                                    (max_cte - min_cte)) *
+                                                    self.cte_plot_rect.height)
+                points.append((x, y))
+
+            pygame.draw.lines(self.screen, (255, 220, 0), False, points, 2)
+
+            # Last point highlight
+            last_cte = self.cte_history[-1]
+            lc = max(min_cte, min(max_cte, last_cte))
+            y_last = self.cte_plot_rect.bottom - int(((lc - min_cte)/(max_cte-min_cte)) *
+                                                    self.cte_plot_rect.height)
+
+            last_x = self.cte_plot_rect.left + len(self.cte_history) - 1
+            pygame.draw.circle(self.screen, (255, 255, 255), (last_x, y_last), 5)
+            pygame.draw.circle(self.screen, (255, 220, 0), (last_x, y_last), 3)
+
+            # Floating value box
+            text = self.font.render(f"{last_cte:.2f} m", True, (255, 255, 255))
+            rect = text.get_rect(topright=(self.cte_plot_rect.right - 10, y_last + 5))
+            bg = rect.inflate(10, 6)
+
+            pygame.draw.rect(self.screen, (20, 20, 20), bg, border_radius=3)
+            pygame.draw.rect(self.screen, (255, 220, 0), bg, width=1, border_radius=3)
+            self.screen.blit(text, rect)
+    def render(self, vehicle, target_vel_ms, actual_vel_ms, steer=0.0, cte=0.0, he=0.0, fut_yaw=0.0, future_path_curvature=0.0, yaw_rate=0.0):
         """Main render loop. Draws all components."""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
-
+        if self.log_frame:
+            self._log_frame(target_vel_ms, actual_vel_ms, steer, cte, he, fut_yaw, future_path_curvature, yaw_rate) # Log telemetry data
         self.target_vel_history.append(target_vel_ms)
         self.actual_vel_history.append(actual_vel_ms)
         self.steer_history.append(steer) # Log steering data
-
+        self.cte_history.append(cte)
         self.screen.fill(self.background_color)
         
         pygame.draw.rect(self.screen, (40, 40, 40), self.minimap_rect.inflate(10, 10), border_radius=5)
@@ -240,9 +325,13 @@ class PygameVisualizer:
         
         self._draw_velocity_plot()
         self._draw_steer_plot() # Render the new plot
-        
+        self._draw_cte_plot()
         pygame.display.flip()
         return True
+    def _log_frame(self, target_vel, actual_vel, steer, cte, he, fut_yaw, future_path_curvature, yaw_rate):
+        self.log_writer.writerow([target_vel, actual_vel, steer, cte, he, fut_yaw, future_path_curvature, yaw_rate])
+        self.log_file.flush()  # ensures data is NOT lost on crash
 
     def destroy(self):
+        self.log_file.close()
         pygame.quit()
